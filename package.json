@@ -1,0 +1,15 @@
+{
+  "name": "scrubber-proxy",
+  "version": "0.1.0",
+  "description": "PII/secret scrubber HTTP service — regex + dictionary, reversible mapping store.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.3.0"
+  }
+}

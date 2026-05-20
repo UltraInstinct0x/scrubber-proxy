@@ -1,0 +1,9 @@
+{
+  "name": "tr",
+  "version": "0.1.0",
+  "description": "Turkey — TC Kimlik No (11-digit checksum), Turkish mobile +90 5xx.",
+  "rules": [
+    { "token": "TCKN", "pattern": "\\b\\d{11}\\b", "flags": "g", "validator": "tckn" },
+    { "token": "PHONE_TR", "pattern": "(?<![\\d])(?:\\+?90[\\s.-]?)?5\\d{2}[\\s.-]?\\d{3}[\\s.-]?\\d{2}[\\s.-]?\\d{2}(?![\\d])", "flags": "g" }
+  ]
+}

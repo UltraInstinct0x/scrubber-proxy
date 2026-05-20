@@ -1,0 +1,17 @@
+{
+  "name": "base",
+  "version": "0.1.0",
+  "description": "Baseline PII regexes — email, generic phone, URL with token, credit card, IPv4, SSH/PEM blocks, common API key shapes.",
+  "rules": [
+    { "token": "EMAIL", "pattern": "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}", "flags": "g" },
+    { "token": "URL_WITH_TOKEN", "pattern": "https?://[^\\s]*(?:token|key|secret|sig|auth)=[^\\s&]+", "flags": "gi" },
+    { "token": "CC", "pattern": "\\b(?:\\d[ -]*?){13,19}\\b", "flags": "g", "validator": "luhn" },
+    { "token": "SSN", "pattern": "\\b\\d{3}-\\d{2}-\\d{4}\\b", "flags": "g" },
+    { "token": "IPV4", "pattern": "\\b(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)(?:\\.(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)){3}\\b", "flags": "g" },
+    { "token": "PHONE", "pattern": "(?<![\\d.])\\+?\\d[\\d\\s().-]{8,17}\\d(?![\\d.])", "flags": "g" },
+    { "token": "BEARER", "pattern": "(?:Bearer\\s+)[A-Za-z0-9._\\-]{20,}", "flags": "gi" },
+    { "token": "PEM_KEY", "pattern": "-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----", "flags": "g" },
+    { "token": "OPENAI_KEY", "pattern": "sk-[A-Za-z0-9]{20,}", "flags": "g" },
+    { "token": "AWS_KEY", "pattern": "AKIA[0-9A-Z]{16}", "flags": "g" }
+  ]
+}

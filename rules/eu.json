@@ -1,0 +1,10 @@
+{
+  "name": "eu",
+  "version": "0.1.0",
+  "description": "EU specifics — IBAN (mod-97 validated), generic EU mobile patterns, UK NIN.",
+  "rules": [
+    { "token": "IBAN", "pattern": "\\b[A-Z]{2}\\d{2}[A-Z0-9]{10,30}\\b", "flags": "g", "validator": "iban_mod97" },
+    { "token": "PHONE_EU", "pattern": "(?<![\\d])\\+(?:33|34|39|44|49|31|32|45|46|47|48|351|353|358|420|421)[\\s.-]?\\d[\\d\\s.-]{7,14}(?![\\d])", "flags": "g" },
+    { "token": "UK_NIN", "pattern": "\\b[A-CEGHJ-PR-TW-Z]{2}\\d{6}[A-D]\\b", "flags": "g" }
+  ]
+}

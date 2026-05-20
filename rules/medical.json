@@ -1,0 +1,10 @@
+{
+  "name": "medical",
+  "version": "0.1.0-todo",
+  "description": "Medical/HIPAA-adjacent — ICD-10 code shape + US NDC drug code shape. TODO: full ICD-10 prefix list from CMS source; this v0 catches code-like spans only.",
+  "rules": [
+    { "token": "ICD10", "pattern": "\\b[A-TV-Z][0-9][0-9A-Z](?:\\.[0-9A-Z]{1,4})?\\b", "flags": "g" },
+    { "token": "NDC", "pattern": "\\b\\d{4,5}-\\d{3,4}-\\d{1,2}\\b", "flags": "g" },
+    { "token": "MRN", "pattern": "\\b(?:MRN|mrn)[:#\\s]*[A-Z0-9-]{5,}\\b", "flags": "g" }
+  ]
+}
