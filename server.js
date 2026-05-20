@@ -16,7 +16,12 @@ const DATA_DIR = process.env.SCRUBBER_DATA_DIR || path.join(__dirname, 'data');
 const RULES_DIR = path.join(__dirname, 'rules');
 const REVERSAL_KEY_RAW = process.env.SCRUBBER_REVERSAL_KEY || 'dev-key-do-not-use-in-prod-dev-key-do-not-use-in-prod';
 const REVERSAL_KEY = crypto.createHash('sha256').update(REVERSAL_KEY_RAW).digest();
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
+const JWT_SECRET = process.env.SCRUBBER_JWT_SECRET || '';
+const JWT_TTL_SECONDS = 300;
+if (!JWT_SECRET) {
+  console.warn('[scrubber] SCRUBBER_JWT_SECRET unset — attestation JWTs disabled');
+}
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const db = new Database(path.join(DATA_DIR, 'mappings.db'));
@@ -32,6 +37,16 @@ CREATE TABLE IF NOT EXISTS mappings (
   PRIMARY KEY (mapping_id, token)
 );
 CREATE INDEX IF NOT EXISTS idx_mappings_created ON mappings(created_at);
+CREATE TABLE IF NOT EXISTS attestations (
+  jti TEXT PRIMARY KEY,
+  iat INTEGER NOT NULL,
+  exp INTEGER NOT NULL,
+  input_hash TEXT NOT NULL,
+  output_hash TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  engine_version TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attestations_exp ON attestations(exp);
 `);
 
 // Garbage-collect rows older than 30d
@@ -226,6 +241,33 @@ function renderMetrics() {
   return lines.join('\n') + '\n';
 }
 
+// ---------- attestation JWT (HS256) ----------
+
+function b64u(buf) {
+  return Buffer.from(buf).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+function sha256Hex(s) {
+  return crypto.createHash('sha256').update(s).digest('hex');
+}
+function issueAttestation({ inputHash, outputHash, mode }) {
+  if (!JWT_SECRET) return null;
+  const jti = crypto.randomBytes(16).toString('hex');
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + JWT_TTL_SECONDS;
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const payload = { jti, iat, exp, input_hash: inputHash, output_hash: outputHash, mode, engine_version: VERSION };
+  const signingInput = `${b64u(JSON.stringify(header))}.${b64u(JSON.stringify(payload))}`;
+  const sig = crypto.createHmac('sha256', JWT_SECRET).update(signingInput).digest();
+  const token = `${signingInput}.${b64u(sig)}`;
+  db.prepare(
+    'INSERT OR REPLACE INTO attestations (jti, iat, exp, input_hash, output_hash, mode, engine_version) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(jti, iat, exp, inputHash, outputHash, mode, VERSION);
+  return { token, jti, iat, exp };
+}
+function getAttestation(jti) {
+  return db.prepare('SELECT jti, iat, exp, input_hash, output_hash, mode, engine_version FROM attestations WHERE jti = ?').get(jti);
+}
+
 // ---------- http server ----------
 
 function send(res, status, obj) {
@@ -270,7 +312,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
       return res.end(renderMetrics());
     }
-    if (req.method === 'POST' && u.pathname === '/scrub') {
+    if (req.method === 'POST' && (u.pathname === '/scrub' || u.pathname === '/v1/scrub')) {
       const body = await readBody(req);
       const rules = parseRules(req.url);
       const wantReversible = body.reversible === true;
@@ -279,14 +321,20 @@ const server = http.createServer(async (req, res) => {
       const t0 = process.hrtime.bigint();
       let result;
       let detections;
+      let mode;
+      let sanitizedPayload;
       if (typeof body.text === 'string') {
         const r = scrubText(body.text, rules, mappingId);
         result = { text: r.text, detections: r.detections };
         detections = r.detections;
+        mode = 'text';
+        sanitizedPayload = r.text;
       } else if (Array.isArray(body.trace)) {
         const r = scrubTrace(body.trace, rules, mappingId);
         result = { trace: r.trace, detections: r.detections };
         detections = r.detections;
+        mode = 'trace';
+        sanitizedPayload = JSON.stringify(r.trace);
       } else {
         return send(res, 400, { error: 'body must include {text} or {trace:[]}' });
       }
@@ -295,12 +343,29 @@ const server = http.createServer(async (req, res) => {
       recordLatency(elapsed);
       recordDetections(detections);
 
+      // attestation JWT — bind to input + sanitized output hash so it can't be replayed across payloads.
+      const inputRaw = typeof body.text === 'string' ? body.text : JSON.stringify(body.trace);
+      const inputHash = sha256Hex(inputRaw);
+      const outputHash = sha256Hex(sanitizedPayload);
+      const att = issueAttestation({ inputHash, outputHash, mode });
+
       return send(res, 200, {
         ...result,
         rules_applied: rules,
         engine_version: VERSION,
         mapping_id: mappingId,
+        mode,
+        attestation: att ? att.token : null,
+        attestation_meta: att ? { jti: att.jti, iat: att.iat, exp: att.exp, input_hash: inputHash, output_hash: outputHash } : null,
       });
+    }
+    if (req.method === 'GET' && u.pathname.startsWith('/v1/attestations/')) {
+      const jti = u.pathname.slice('/v1/attestations/'.length);
+      if (!jti || !/^[a-f0-9]{32}$/.test(jti)) return send(res, 400, { error: 'bad_jti' });
+      const row = getAttestation(jti);
+      if (!row) return send(res, 404, { error: 'not_found' });
+      const now = Math.floor(Date.now() / 1000);
+      return send(res, 200, { ...row, valid: row.exp > now });
     }
     if (req.method === 'POST' && u.pathname === '/reverse') {
       const body = await readBody(req);

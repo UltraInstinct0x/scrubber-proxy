@@ -1,6 +1,6 @@
 {
   "name": "scrubber-proxy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "PII/secret scrubber HTTP service — regex + dictionary, reversible mapping store.",
   "main": "server.js",
   "type": "commonjs",

@@ -14,7 +14,26 @@ POST text or an agent trace; returns the same body with PII/secrets replaced by 
 - **no NLP / NER.** doesn't catch novel name patterns or context-dependent PII. add a rule pack or post-process if you need that.
 - **no irreversibility.** mappings are stored encrypted under a static env key. that's a *feature* for audit/legal-hold, document it honestly to your buyers.
 - **single env key, no rotation.** PoC-grade. swap in KMS for v1.
-- **no signed attestation jwt** (yet). spec'd in `Scrubber Proxy Design.md`, deferred to v0.2.
+
+## attestation tokens (v0.2)
+
+every `/scrub` (and `/v1/scrub`) response now includes a short-lived HS256 JWT bound to the sanitized output. consumers (e.g. panel ingest) verify it to prove "this payload went through the scrubber".
+
+token payload:
+
+```json
+{ "jti":"<hex16>", "iat":1234567890, "exp":1234568190,
+  "input_hash":"<sha256(input_raw)>",
+  "output_hash":"<sha256(sanitized_output)>",
+  "mode":"text|trace",
+  "engine_version":"0.2.0" }
+```
+
+signing key: `SCRUBBER_JWT_SECRET` (HS256, 32 bytes hex). lives in `~/.secrets/scrubber.env` (600). consumers share the same secret in their own env. ttl: 300s.
+
+verification roundtrip: `GET /v1/attestations/:jti` → `{jti, iat, exp, input_hash, output_hash, mode, engine_version, valid}`.
+
+the `output_hash` is the critical bit — without checking it on the consumer side, the JWT degrades into a generic bearer token replayable across any payload.
 
 ## endpoints
 
@@ -22,7 +41,8 @@ POST text or an agent trace; returns the same body with PII/secrets replaced by 
 |---|---|---|
 | GET | `/health` | liveness + version + loaded packs |
 | GET | `/rules` | list available rule packs + counts |
-| POST | `/scrub?rules=base,medical,tr` | scrub `{text}` or `{trace:[{role,content}]}` |
+| POST | `/scrub?rules=base,medical,tr` | scrub `{text}` or `{trace:[{role,content}]}` (alias: `/v1/scrub`) |
+| GET | `/v1/attestations/:jti` | look up a previously-issued attestation |
 | POST | `/reverse` | `{mapping_id, token}` → `{original}` |
 
 ### example
