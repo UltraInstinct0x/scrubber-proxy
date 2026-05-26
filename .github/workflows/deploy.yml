@@ -1,0 +1,38 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-scrubber-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy to scrubber.goku.codes
+    runs-on: [self-hosted, panel-prod]
+    timeout-minutes: 5
+    steps:
+      - name: pull latest
+        run: |
+          cd "$HOME/scrubber-proxy"
+          git fetch --prune origin
+          git checkout main
+          git reset --hard origin/main
+          git log -1 --oneline
+
+      - name: restart service
+        run: |
+          systemctl --user restart scrubber
+          sleep 2
+          systemctl --user status scrubber --no-pager
+          curl -sf https://scrubber.goku.codes/health | grep '"ok":true'
+
+      - name: smoke
+        run: |
+          curl -sfI https://scrubber.goku.codes/ | grep '200 OK'
+          curl -sf -X POST https://scrubber.goku.codes/scrub?rules=base \
+            -H 'content-type: application/json' \
+            -d '{"text":"test@example.com"}' | grep EMAIL
