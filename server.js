@@ -4,7 +4,7 @@
 
 'use strict';
 
-const http = require('http');
+const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -270,25 +270,6 @@ function getAttestation(jti) {
 
 // ---------- http server ----------
 
-function send(res, status, obj) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(obj));
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => {
-      try {
-        const raw = Buffer.concat(chunks).toString('utf8');
-        resolve(raw ? JSON.parse(raw) : {});
-      } catch (e) { reject(e); }
-    });
-    req.on('error', reject);
-  });
-}
-
 function parseRules(url) {
   const q = new URL(url, 'http://x').searchParams.get('rules');
   if (!q) return ['base'];
@@ -296,93 +277,121 @@ function parseRules(url) {
   return names.length ? names : ['base'];
 }
 
-const server = http.createServer(async (req, res) => {
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.use(express.static('public'));
+app.get('/', (req, res) => {
+  return res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.get('/health', (req, res) => {
+  return res.status(200).json({ ok: true, version: VERSION, rules: Object.keys(RULE_PACKS) });
+});
+
+app.get('/rules', (req, res) => {
+  const summary = Object.values(RULE_PACKS).map((p) => ({
+    name: p.name, version: p.version, description: p.description, rule_count: p.rules.length,
+  }));
+  return res.status(200).json({ packs: summary });
+});
+
+app.get('/metrics', (req, res) => {
+  res.type('text/plain; version=0.0.4');
+  return res.status(200).send(renderMetrics());
+});
+
+async function handleScrub(req, res) {
+  const body = req.body || {};
+  const rules = parseRules(req.originalUrl || req.url);
+  const wantReversible = body.reversible === true;
+  const mappingId = wantReversible ? crypto.randomBytes(12).toString('hex') : null;
+
+  const t0 = process.hrtime.bigint();
+  let result;
+  let detections;
+  let mode;
+  let sanitizedPayload;
+  if (typeof body.text === 'string') {
+    const r = scrubText(body.text, rules, mappingId);
+    result = { text: r.text, detections: r.detections };
+    detections = r.detections;
+    mode = 'text';
+    sanitizedPayload = r.text;
+  } else if (Array.isArray(body.trace)) {
+    const r = scrubTrace(body.trace, rules, mappingId);
+    result = { trace: r.trace, detections: r.detections };
+    detections = r.detections;
+    mode = 'trace';
+    sanitizedPayload = JSON.stringify(r.trace);
+  } else {
+    return res.status(400).json({ error: 'body must include {text} or {trace:[]}' });
+  }
+  const elapsed = Number(process.hrtime.bigint() - t0) / 1e9;
+  METRICS.scrub_requests_total += 1;
+  recordLatency(elapsed);
+  recordDetections(detections);
+
+  // attestation JWT — bind to input + sanitized output hash so it can't be replayed across payloads.
+  const inputRaw = typeof body.text === 'string' ? body.text : JSON.stringify(body.trace);
+  const inputHash = sha256Hex(inputRaw);
+  const outputHash = sha256Hex(sanitizedPayload);
+  const att = issueAttestation({ inputHash, outputHash, mode });
+
+  return res.status(200).json({
+    ...result,
+    rules_applied: rules,
+    engine_version: VERSION,
+    mapping_id: mappingId,
+    mode,
+    attestation: att ? att.token : null,
+    attestation_meta: att ? { jti: att.jti, iat: att.iat, exp: att.exp, input_hash: inputHash, output_hash: outputHash } : null,
+  });
+}
+
+app.post('/scrub', async (req, res, next) => {
   try {
-    const u = new URL(req.url, 'http://x');
-    if (req.method === 'GET' && u.pathname === '/health') {
-      return send(res, 200, { ok: true, version: VERSION, rules: Object.keys(RULE_PACKS) });
-    }
-    if (req.method === 'GET' && u.pathname === '/rules') {
-      const summary = Object.values(RULE_PACKS).map((p) => ({
-        name: p.name, version: p.version, description: p.description, rule_count: p.rules.length,
-      }));
-      return send(res, 200, { packs: summary });
-    }
-    if (req.method === 'GET' && u.pathname === '/metrics') {
-      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
-      return res.end(renderMetrics());
-    }
-    if (req.method === 'POST' && (u.pathname === '/scrub' || u.pathname === '/v1/scrub')) {
-      const body = await readBody(req);
-      const rules = parseRules(req.url);
-      const wantReversible = body.reversible === true;
-      const mappingId = wantReversible ? crypto.randomBytes(12).toString('hex') : null;
-
-      const t0 = process.hrtime.bigint();
-      let result;
-      let detections;
-      let mode;
-      let sanitizedPayload;
-      if (typeof body.text === 'string') {
-        const r = scrubText(body.text, rules, mappingId);
-        result = { text: r.text, detections: r.detections };
-        detections = r.detections;
-        mode = 'text';
-        sanitizedPayload = r.text;
-      } else if (Array.isArray(body.trace)) {
-        const r = scrubTrace(body.trace, rules, mappingId);
-        result = { trace: r.trace, detections: r.detections };
-        detections = r.detections;
-        mode = 'trace';
-        sanitizedPayload = JSON.stringify(r.trace);
-      } else {
-        return send(res, 400, { error: 'body must include {text} or {trace:[]}' });
-      }
-      const elapsed = Number(process.hrtime.bigint() - t0) / 1e9;
-      METRICS.scrub_requests_total += 1;
-      recordLatency(elapsed);
-      recordDetections(detections);
-
-      // attestation JWT — bind to input + sanitized output hash so it can't be replayed across payloads.
-      const inputRaw = typeof body.text === 'string' ? body.text : JSON.stringify(body.trace);
-      const inputHash = sha256Hex(inputRaw);
-      const outputHash = sha256Hex(sanitizedPayload);
-      const att = issueAttestation({ inputHash, outputHash, mode });
-
-      return send(res, 200, {
-        ...result,
-        rules_applied: rules,
-        engine_version: VERSION,
-        mapping_id: mappingId,
-        mode,
-        attestation: att ? att.token : null,
-        attestation_meta: att ? { jti: att.jti, iat: att.iat, exp: att.exp, input_hash: inputHash, output_hash: outputHash } : null,
-      });
-    }
-    if (req.method === 'GET' && u.pathname.startsWith('/v1/attestations/')) {
-      const jti = u.pathname.slice('/v1/attestations/'.length);
-      if (!jti || !/^[a-f0-9]{32}$/.test(jti)) return send(res, 400, { error: 'bad_jti' });
-      const row = getAttestation(jti);
-      if (!row) return send(res, 404, { error: 'not_found' });
-      const now = Math.floor(Date.now() / 1000);
-      return send(res, 200, { ...row, valid: row.exp > now });
-    }
-    if (req.method === 'POST' && u.pathname === '/reverse') {
-      const body = await readBody(req);
-      if (!body.mapping_id || !body.token) {
-        return send(res, 400, { error: 'mapping_id and token required' });
-      }
-      const original = reverseMapping(body.mapping_id, body.token);
-      if (original === null) return send(res, 404, { error: 'not_found' });
-      return send(res, 200, { original });
-    }
-    return send(res, 404, { error: 'not_found' });
+    return await handleScrub(req, res);
   } catch (e) {
-    console.error('[scrubber] error', e);
-    return send(res, 500, { error: String(e && e.message || e) });
+    return next(e);
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`[scrubber] listening on ${HOST}:${PORT}`);
+app.post('/v1/scrub', async (req, res, next) => {
+  try {
+    return await handleScrub(req, res);
+  } catch (e) {
+    return next(e);
+  }
+});
+
+app.get('/v1/attestations/:jti', (req, res) => {
+  const jti = req.params.jti;
+  if (!jti || !/^[a-f0-9]{32}$/.test(jti)) return res.status(400).json({ error: 'bad_jti' });
+  const row = getAttestation(jti);
+  if (!row) return res.status(404).json({ error: 'not_found' });
+  const now = Math.floor(Date.now() / 1000);
+  return res.status(200).json({ ...row, valid: row.exp > now });
+});
+
+app.post('/reverse', (req, res) => {
+  const body = req.body || {};
+  if (!body.mapping_id || !body.token) {
+    return res.status(400).json({ error: 'mapping_id and token required' });
+  }
+  const original = reverseMapping(body.mapping_id, body.token);
+  if (original === null) return res.status(404).json({ error: 'not_found' });
+  return res.status(200).json({ original });
+});
+
+app.use((req, res) => {
+  return res.status(404).json({ error: 'not_found' });
+});
+
+app.use((err, req, res, next) => {
+  console.error('[scrubber] error', err);
+  return res.status(500).json({ error: String((err && err.message) || err) });
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`[scrubber] listening on http://${HOST}:${PORT}`);
 });
