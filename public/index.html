@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>scrubber-proxy</title>
+  <style>
+    :root {
+      --bg: #08090a; --bg-2: #0f1011; --bg-3: #191a1b; --fg: #f7f8f8; --fg-2: #d0d6e0;
+      --fg-dim: #8a8f98; --fg-faint: #62666d; --accent: #67e8f9; --danger: #f87171; --ok: #4ade80;
+      --border: rgba(255,255,255,.08); --border-subtle: rgba(255,255,255,.05); --radius: 8px;
+      --sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--sans); line-height: 1.55; }
+    a { color: var(--accent); text-decoration: none; } a:hover { color: #fff; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 56px; }
+    .top { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-subtle); padding-bottom: 14px; margin-bottom: 30px; }
+    .brand { font-weight: 620; letter-spacing: -.01em; }
+    .badge { font-size: 12px; border: 1px solid rgba(103,232,249,.35); color: var(--accent); border-radius: 999px; padding: 3px 10px; }
+    h1 { font-size: clamp(32px, 7vw, 58px); letter-spacing: -.03em; line-height: 1.03; margin: 0 0 10px; }
+    h2 { font-size: 22px; margin: 0 0 8px; letter-spacing: -.015em; }
+    p { margin: 0 0 12px; color: var(--fg-2); }
+    .subtle { color: var(--fg-dim); }
+    .hero { display: grid; grid-template-columns: 1.1fr 1fr; gap: 18px; margin-bottom: 20px; }
+    .card { background: rgba(255,255,255,.02); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+    .eyebrow { color: var(--fg-dim); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 10px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    textarea, pre { width: 100%; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-2); color: var(--fg-2); font-family: var(--mono); font-size: 13px; }
+    textarea { min-height: 145px; padding: 10px 12px; resize: vertical; }
+    pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+    .checks { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0; }
+    .checks label { border: 1px solid var(--border); padding: 7px 10px; border-radius: 999px; font-size: 13px; color: var(--fg-2); }
+    .checks input { vertical-align: -1px; }
+    .row { display: flex; align-items: center; gap: 10px; }
+    button { background: var(--accent); color: #001016; border: 0; border-radius: 6px; padding: 10px 14px; font-weight: 620; cursor: pointer; }
+    button:hover { background: #a5f3fc; }
+    .ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+    .error { color: var(--danger); font-size: 13px; min-height: 20px; margin-top: 8px; }
+    .ok { color: var(--ok); }
+    .mono { font-family: var(--mono); }
+    .section { margin-top: 28px; }
+    .snippet { position: relative; }
+    .copy { position: absolute; top: 9px; right: 9px; padding: 5px 8px; font-size: 11px; background: var(--bg-3); color: var(--fg-2); border: 1px solid var(--border-subtle); border-radius: 6px; }
+    ul { margin: 0; padding-left: 18px; color: var(--fg-2); }
+    footer { margin-top: 38px; padding-top: 18px; border-top: 1px solid var(--border-subtle); color: var(--fg-dim); font-size: 14px; }
+    @media (max-width: 900px) { .hero, .grid2 { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="top">
+      <div class="brand">scrubber.goku.codes</div>
+      <div class="badge">v0.2 attestation</div>
+    </div>
+
+    <section class="hero">
+      <article class="card">
+        <div class="eyebrow">pii/secret scrubber</div>
+        <h1>regex + dictionary.<br>defense-in-depth.</h1>
+        <p class="subtle">not ai. not magic. deterministic scrubber for traces before they leave your boundary.</p>
+        <p class="mono subtle">fail-closed consumers should block on scrub failure.</p>
+      </article>
+
+      <article class="card">
+        <div class="eyebrow">live demo</div>
+        <label for="input" class="subtle">input</label>
+        <textarea id="input">contact: jane@example.com, +90 532 555 1234, tc: 10000000146, cc: 4242 4242 4242 4242, key: sk-live-openai-shape-1234567890abcdef</textarea>
+        <div class="checks" id="checks">
+          <label><input type="checkbox" value="base" checked> base</label>
+          <label><input type="checkbox" value="eu"> eu</label>
+          <label><input type="checkbox" value="tr" checked> tr</label>
+          <label><input type="checkbox" value="medical"> medical</label>
+        </div>
+        <div class="row">
+          <button id="run">scrub now</button>
+          <span id="status" class="subtle mono"></span>
+        </div>
+        <div id="error" class="error" role="alert"></div>
+      </article>
+    </section>
+
+    <section class="grid2">
+      <article class="card">
+        <div class="eyebrow">scrubbed output</div>
+        <pre id="output">(run demo)</pre>
+      </article>
+      <article class="card">
+        <div class="eyebrow">decoded attestation jwt payload</div>
+        <pre id="attestation">(run demo)</pre>
+      </article>
+    </section>
+
+    <section class="section card">
+      <h2>rule packs</h2>
+      <p class="subtle">loaded live from <code>/rules</code> when available.</p>
+      <pre id="rulesList">loading...</pre>
+    </section>
+
+    <section class="section grid2">
+      <article class="card snippet">
+        <button class="copy" data-copy="curl1">copy</button>
+        <h2>scrub text</h2>
+        <pre id="curl1">curl -s -X POST https://scrubber.goku.codes/scrub?rules=base,tr \
+  -H 'content-type: application/json' \
+  -d '{"text":"call +90 532 555 1234 or jane@example.com. tc: 10000000146"}'</pre>
+      </article>
+      <article class="card snippet">
+        <button class="copy" data-copy="curl2">copy</button>
+        <h2>attestation lookup</h2>
+        <pre id="curl2">curl -s https://scrubber.goku.codes/v1/attestations/&lt;jti&gt;</pre>
+      </article>
+    </section>
+
+    <section class="section card">
+      <h2>what it isn't</h2>
+      <ul>
+        <li><strong>not magic.</strong> regex + dictionary recall, not 100%. treat as defense-in-depth, not a guarantee.</li>
+        <li><strong>no nlp / ner.</strong> it won't catch novel name patterns or context-dependent pii without new packs.</li>
+        <li><strong>no irreversibility.</strong> reversible encrypted mappings are intentional for audit/legal-hold flows.</li>
+      </ul>
+    </section>
+
+    <footer>
+      <a href="https://github.com/UltraInstinct0x/scrubber-proxy" target="_blank" rel="noreferrer">github</a>
+      · <a href="https://panel.goku.codes" target="_blank" rel="noreferrer">panel.goku.codes</a>
+      · <a href="https://panel.goku.codes/contact" target="_blank" rel="noreferrer">contact</a>
+    </footer>
+  </main>
+
+  <script>
+    const fallbackRules = [
+      { name: 'base', description: 'email, phone, credit card, key shapes', rule_count: 0 },
+      { name: 'eu', description: 'iban + eu ids', rule_count: 0 },
+      { name: 'tr', description: 'tckn + tr mobile', rule_count: 0 },
+      { name: 'medical', description: 'icd-10/ndc/mrn shapes', rule_count: 0 }
+    ];
+
+    function selectedRules() {
+      const checked = [...document.querySelectorAll('#checks input:checked')].map((i) => i.value);
+      return checked.length ? checked : ['base'];
+    }
+
+    function decodeJwtPayload(token) {
+      if (!token || typeof token !== 'string') return null;
+      const parts = token.split('.');
+      if (parts.length !== 3) return null;
+      try {
+        const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+        const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+        return JSON.parse(atob(padded));
+      } catch {
+        return null;
+      }
+    }
+
+    async function loadRules() {
+      const box = document.getElementById('rulesList');
+      try {
+        const r = await fetch('/rules');
+        if (!r.ok) throw new Error('rules fetch failed');
+        const data = await r.json();
+        const packs = Array.isArray(data.packs) ? data.packs : fallbackRules;
+        box.textContent = packs.map((p) => `${p.name.padEnd(7)} ${String(p.rule_count).padStart(2)}  ${p.description || ''}`).join('\n');
+      } catch {
+        box.textContent = fallbackRules.map((p) => `${p.name.padEnd(7)} --  ${p.description}`).join('\n');
+      }
+    }
+
+    async function runDemo() {
+      const input = document.getElementById('input').value;
+      const rules = selectedRules().join(',');
+      const out = document.getElementById('output');
+      const att = document.getElementById('attestation');
+      const err = document.getElementById('error');
+      const status = document.getElementById('status');
+      err.textContent = '';
+      status.textContent = 'POST /scrub?rules=' + rules;
+      try {
+        const r = await fetch(`/scrub?rules=${encodeURIComponent(rules)}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text: input })
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          throw new Error(data.error || `scrub failed (${r.status})`);
+        }
+        out.textContent = JSON.stringify(data, null, 2);
+        const payload = decodeJwtPayload(data.attestation);
+        att.textContent = payload ? JSON.stringify(payload, null, 2) : 'no attestation (SCRUBBER_JWT_SECRET unset?)';
+        status.textContent = 'ok';
+        status.className = 'ok mono';
+      } catch (e) {
+        out.textContent = '(no output)';
+        att.textContent = '(no attestation)';
+        err.textContent = `fail-closed: scrub call failed — ${e.message}`;
+        status.textContent = 'error';
+        status.className = 'mono';
+      }
+    }
+
+    document.getElementById('run').addEventListener('click', runDemo);
+    document.querySelectorAll('.copy').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.getAttribute('data-copy');
+        const text = document.getElementById(id).textContent;
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = 'copied';
+          setTimeout(() => (btn.textContent = 'copy'), 1200);
+        } catch {
+          btn.textContent = 'no clipboard';
+          setTimeout(() => (btn.textContent = 'copy'), 1200);
+        }
+      });
+    });
+
+    loadRules();
+    runDemo();
+  </script>
+</body>
+</html>
