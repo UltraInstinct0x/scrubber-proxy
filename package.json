@@ -1,6 +1,6 @@
 {
   "name": "scrubber-proxy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "PII/secret scrubber HTTP service — regex + dictionary, reversible mapping store.",
   "main": "server.js",
   "type": "commonjs",
@@ -11,6 +11,8 @@
   "license": "MIT",
   "dependencies": {
     "better-sqlite3": "^11.3.0",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "pino": "^9.3.2",
+    "prom-client": "^15.1.3"
   }
 }

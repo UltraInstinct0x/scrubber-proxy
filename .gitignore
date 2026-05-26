@@ -2,3 +2,6 @@ node_modules/
 .env
 *.log
 data/
+.omo/
+*.db-wal
+*.db-shm
