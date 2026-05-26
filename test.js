@@ -10,14 +10,19 @@ const fs = require('fs');
 const os = require('os');
 
 const SECRET = 'a'.repeat(64);
+const API_KEY = 'test-key';
 const PORT = 13917 + Math.floor(Math.random() * 100);
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'scrubber-test-'));
 
 function req(method, urlPath, body) {
   return new Promise((resolve, reject) => {
     const data = body ? Buffer.from(JSON.stringify(body)) : null;
+    const headers = {
+      'x-scrubber-key': API_KEY,
+      ...(data ? { 'content-type': 'application/json', 'content-length': data.length } : {}),
+    };
     const r = http.request(
-      { host: '127.0.0.1', port: PORT, path: urlPath, method, headers: data ? { 'content-type': 'application/json', 'content-length': data.length } : {} },
+      { host: '127.0.0.1', port: PORT, path: urlPath, method, headers },
       (res) => {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -41,7 +46,14 @@ function b64uDecode(s) {
 
 (async () => {
   const proc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', SCRUBBER_JWT_SECRET: SECRET, SCRUBBER_DATA_DIR: TMP },
+    env: {
+      ...process.env,
+      PORT: String(PORT),
+      HOST: '127.0.0.1',
+      SCRUBBER_JWT_SECRET: SECRET,
+      SCRUBBER_DATA_DIR: TMP,
+      SCRUBBER_API_KEY: API_KEY,
+    },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
   // wait for listen
