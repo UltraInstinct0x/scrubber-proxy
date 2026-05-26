@@ -8,10 +8,13 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { WebSocketServer, WebSocket } = require('ws');
 
 const SECRET = 'a'.repeat(64);
 const API_KEY = 'test-key';
 const PORT = 13917 + Math.floor(Math.random() * 100);
+const UPSTREAM_HTTP_PORT = PORT + 200;
+const UPSTREAM_WS_PORT = PORT + 400;
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'scrubber-test-'));
 
 function req(method, urlPath, body) {
@@ -28,13 +31,25 @@ function req(method, urlPath, body) {
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
           const raw = Buffer.concat(chunks).toString('utf8');
-          try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); } catch { resolve({ status: res.statusCode, body: raw }); }
+          try { resolve({ status: res.statusCode, body: JSON.parse(raw), headers: res.headers }); } catch { resolve({ status: res.statusCode, body: raw, headers: res.headers }); }
         });
       },
     );
     r.on('error', reject);
     if (data) r.write(data);
     r.end();
+  });
+}
+
+function wsRoundtrip(url, text) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, { headers: { 'x-scrubber-key': API_KEY } });
+    ws.once('open', () => ws.send(text));
+    ws.once('message', (msg) => {
+      resolve(msg.toString('utf8'));
+      ws.close();
+    });
+    ws.once('error', reject);
   });
 }
 
@@ -45,6 +60,24 @@ function b64uDecode(s) {
 }
 
 (async () => {
+  const upstreamHttp = http.createServer((reqIn, resIn) => {
+    const chunks = [];
+    reqIn.on('data', (c) => chunks.push(c));
+    reqIn.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      resIn.setHeader('content-type', 'application/json');
+      resIn.end(JSON.stringify({ got: raw, upstream_note: 'reply from jane@example.com' }));
+    });
+  });
+  await new Promise((resolve) => upstreamHttp.listen(UPSTREAM_HTTP_PORT, '127.0.0.1', resolve));
+
+  const upstreamWsServer = new WebSocketServer({ port: UPSTREAM_WS_PORT, host: '127.0.0.1' });
+  upstreamWsServer.on('connection', (socket) => {
+    socket.on('message', (data, isBinary) => {
+      socket.send(data, { binary: isBinary });
+    });
+  });
+
   const proc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
     env: {
       ...process.env,
@@ -53,6 +86,8 @@ function b64uDecode(s) {
       SCRUBBER_JWT_SECRET: SECRET,
       SCRUBBER_DATA_DIR: TMP,
       SCRUBBER_API_KEY: API_KEY,
+      SCRUBBER_PROXY_ALLOW_PRIVATE: 'true',
+      SCRUBBER_CLUSTER_WORKERS: '1',
     },
     stdio: ['ignore', 'inherit', 'inherit'],
   });
@@ -88,8 +123,26 @@ function b64uDecode(s) {
     // bad jti
     const bad = await req('GET', '/v1/attestations/deadbeef');
     assert(bad.status === 400, 'bad jti rejected with 400');
+
+    const proxyReq = await req(
+      'POST',
+      `/proxy?rules=base&scrub_response=true&target=${encodeURIComponent(`http://127.0.0.1:${UPSTREAM_HTTP_PORT}/echo`)}`,
+      { text: 'contact me at jane@example.com', reversible: true },
+    );
+    assert(proxyReq.status === 200, '/proxy returns 200');
+    assert(typeof proxyReq.body.got === 'string' && proxyReq.body.got.includes('<EMAIL_1>'), '/proxy scrubs outbound request body');
+    assert(proxyReq.body.upstream_note.includes('<EMAIL_1>'), '/proxy scrubs inbound response body when scrub_response=true');
+    assert(typeof proxyReq.headers['x-scrubber-attestation'] === 'string', '/proxy sets x-scrubber-attestation');
+    assert(typeof proxyReq.headers['x-scrub-mapping-id-req'] === 'string', '/proxy sets x-scrub-mapping-id-req in reversible mode');
+    assert(typeof proxyReq.headers['x-scrub-mapping-id-res'] === 'string', '/proxy sets x-scrub-mapping-id-res when response scrubbed in reversible mode');
+
+    const wsUrl = `ws://127.0.0.1:${PORT}/ws?rules=base&target=${encodeURIComponent(`ws://127.0.0.1:${UPSTREAM_WS_PORT}`)}`;
+    const wsResult = await wsRoundtrip(wsUrl, 'ws email jane@example.com');
+    assert(wsResult.includes('<EMAIL_1>'), '/ws scrubs text frame in bidirectional flow');
   } finally {
     proc.kill('SIGTERM');
+    upstreamHttp.close();
+    upstreamWsServer.close();
   }
   if (failed > 0) { console.error(`\n${failed} failed`); process.exit(1); }
   console.log('\nall green');

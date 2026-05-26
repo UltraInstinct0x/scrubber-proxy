@@ -1,4 +1,4 @@
-# scrubber-proxy v0.3.0
+# scrubber-proxy v0.4.0
 
 PII/secret scrubber HTTP service. Regex + dictionary. No LLM, no hallucinated detections. Reversible by design (encrypted sqlite mapping store). Clustered, authenticated, metered.
 
@@ -35,9 +35,9 @@ Verification roundtrip: `GET /v1/attestations/:jti` → `{jti, iat, exp, input_h
 
 The `output_hash` is the critical bit — without checking it on the consumer side, the JWT degrades into a generic bearer token replayable across any payload.
 
-## v0.3.0 — hardening
+## v0.4.0 — proxy modes
 
-What's new in v0.3.0:
+What's new in v0.4.0:
 
 ### clustering
 - `node:cluster` stdlib, one worker per CPU core
@@ -78,6 +78,8 @@ What's new in v0.3.0:
 | GET | `/metrics` | no | prometheus-text metrics |
 | GET | `/rules` | yes | list available rule packs + counts |
 | POST | `/scrub?rules=base,medical,tr` | yes | scrub `{text}` or `{trace:[{role,content}]}` (alias: `/v1/scrub`) |
+| POST | `/proxy?rules=base&target=<url>` | yes | HTTP reverse proxy with request/response scrubbing |
+| GET | `/ws?rules=base&target=<ws-url>` | yes (upgrade) | bidirectional WebSocket text-frame scrubbing |
 | GET | `/v1/attestations/:jti` | yes | look up a previously-issued attestation |
 | POST | `/reverse` | yes | `{mapping_id, token}` → `{original}` |
 
@@ -138,6 +140,10 @@ All via environment variables:
 | `SCRUBBER_LOG_LEVEL` | `info` | pino level (`trace`, `debug`, `info`, `warn`, `error`, `fatal`) |
 | `SCRUBBER_DATA_DIR` | `./data` | sqlite mapping store location |
 | `SCRUBBER_CLUSTER_WORKERS` | auto | number of workers (default: cpu count) |
+| `SCRUBBER_UPSTREAM_TIMEOUT` | `30000` | upstream HTTP timeout in ms for `/proxy` |
+| `SCRUBBER_CONNECTION_TIMEOUT` | `5000` | connection timeout in ms for upstream WS handshake |
+| `SCRUBBER_PROXY_ALLOW_PRIVATE` | `false` | allow private/loopback targets (dev/testing only) |
+| `SCRUBBER_WS_MAX_CONNECTIONS` | `500` | max active `/ws` proxied connections |
 
 ## fail-closed contract for panel
 
@@ -167,8 +173,8 @@ See `~/panel/deploy/docker-compose.yml` — brings up panel + scrubber side-by-s
 - [x] landing page at scrubber.goku.codes (v0.2)
 - [x] auto-deploy via self-hosted runner (v0.2–0.3)
 - [x] clustering, auth, rate limiting, structured logging, prom metrics (v0.3)
-- [ ] HTTP reverse proxy (`/proxy`) — drop scrubber in front of any API (v0.4)
-- [ ] WebSocket proxy (`/ws`) — bidirectional real-time scrubbing (v0.4)
+- [x] HTTP reverse proxy (`/proxy`) — drop scrubber in front of any API (v0.4)
+- [x] WebSocket proxy (`/ws`) — bidirectional real-time scrubbing (v0.4)
 - [ ] KMS key rotation + multi-tenant + audit hash chain (v0.5)
 - [ ] OpenAPI spec + batch endpoint + JS/Python SDKs (v0.6)
 - [ ] presidio NER long-tail
