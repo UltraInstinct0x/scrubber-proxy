@@ -58,8 +58,8 @@
     <section class="hero">
       <article class="card">
         <div class="eyebrow">pii/secret scrubber</div>
-        <h1>regex + dictionary.<br>defense-in-depth.</h1>
-        <p class="subtle">not ai. not magic. deterministic scrubber for traces before they leave your boundary.</p>
+        <h1>tier-gated scrubbing.<br>100% where it counts.</h1>
+        <p class="subtle">deterministic detection for vendor secrets, structured ids, env vars, and contact data — locked in ci. not ai. not magic. just regex you can audit and a corpus that gates every deploy.</p>
         <p class="mono subtle">fail-closed consumers should block on scrub failure.</p>
       </article>
 
@@ -114,11 +114,23 @@
     </section>
 
     <section class="section card">
+      <h2>enterprise tier guarantees <span class="subtle mono" style="font-weight:400">(v0.6.0)</span></h2>
+      <p class="subtle">deterministic detection, gated by a fixture corpus in CI. if any promised tier ever drops below 100%, the deploy fails — pre-deploy offline and post-deploy against this live host.</p>
+      <ul>
+        <li><strong>L1 vendor secrets — 100%.</strong> openai, anthropic, github pat (classic + fine-grained), stripe, slack, aws, google, hf, supabase, notion, linear, twilio, sendgrid, mailgun, postmark, shopify, square, heroku, digitalocean, npm, pypi, docker, gitlab, jwt, pem blocks.</li>
+        <li><strong>L2 structured ids — 100%.</strong> credit cards (luhn-validated), ssn, ipv4.</li>
+        <li><strong>L3 env-var sweep — 100%.</strong> <code>NAME_KEY|TOKEN|SECRET|PASSWORD|...&nbsp;=&nbsp;value</code>, including quoted values with spaces.</li>
+        <li><strong>L4 contact — 100%.</strong> email and urls carrying token/key/secret/sig/auth/session params.</li>
+        <li><strong>L5 free-form pii — best-effort.</strong> phone numbers and prose-only identifiers. add a rule pack or post-process for the cases your domain requires.</li>
+      </ul>
+    </section>
+
+    <section class="section card">
       <h2>what it isn't</h2>
       <ul>
-        <li><strong>not magic.</strong> regex + dictionary recall, not 100%. treat as defense-in-depth, not a guarantee.</li>
-        <li><strong>no nlp / ner.</strong> it won't catch novel name patterns or context-dependent pii without new packs.</li>
-        <li><strong>no irreversibility.</strong> reversible encrypted mappings are intentional for audit/legal-hold flows.</li>
+        <li><strong>not a free-form pii guarantee.</strong> L1–L4 are 100%-promised and ci-gated; L5 (novel names, context-dependent pii) requires ner and is best-effort. add a rule pack or post-process if you need it.</li>
+        <li><strong>reversible by design.</strong> mappings are stored encrypted under an env key — that's a *feature* for audit and legal-hold, not a bug. document it honestly to your buyers.</li>
+        <li><strong>symmetric hs256 key management today.</strong> v0.5 added kid rotation with env-managed keys; kms-backed key management is on the roadmap.</li>
       </ul>
     </section>
 
