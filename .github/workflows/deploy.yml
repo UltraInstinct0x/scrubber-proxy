@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 5
     defaults:
       run:
-        shell: bash -lc {0}
+        shell: /bin/bash -leo pipefail {0}
     env:
       NVM_DIR: /home/ubuntu/.nvm
     steps:
