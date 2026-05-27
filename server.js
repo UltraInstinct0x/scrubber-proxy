@@ -841,15 +841,17 @@ function startWorker() {
         headers: upstreamHeaders,
       });
 
-      upstream.once('error', () => {
+      const onUpstreamConnectError = () => {
         if (socket.writable) {
           socket.write('HTTP/1.1 502 Bad Gateway\r\nX-Error: upstream-connection-failed\r\n\r\n');
         }
         socket.destroy();
         releaseGlobalWsSlot();
-      });
+      };
+      upstream.once('error', onUpstreamConnectError);
 
       upstream.once('open', () => {
+        upstream.off('error', onUpstreamConnectError);
         wss.handleUpgrade(req, socket, head, (client) => {
           activeWsConnections += 1;
           metrics.scrubWsActiveConnections.set(activeWsConnections);
