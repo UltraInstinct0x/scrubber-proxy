@@ -23,11 +23,17 @@ const DATA_DIR = process.env.SCRUBBER_DATA_DIR || path.join(__dirname, 'data');
 const RULES_DIR = path.join(__dirname, 'rules');
 const REVERSAL_KEY_RAW = process.env.SCRUBBER_REVERSAL_KEY || 'dev-key-do-not-use-in-prod-dev-key-do-not-use-in-prod';
 const REVERSAL_KEY = crypto.createHash('sha256').update(REVERSAL_KEY_RAW).digest();
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const JWT_SECRET = process.env.SCRUBBER_JWT_SECRET || '';
+const JWT_PRIMARY_KEY = process.env.SCRUBBER_JWT_PRIMARY_KEY || '';
+const JWT_VERIFICATION_KEYS_RAW = process.env.SCRUBBER_JWT_VERIFICATION_KEYS || '';
 const JWT_TTL_SECONDS = 300;
 const SCRUBBER_AUTH = (process.env.SCRUBBER_AUTH || 'key').toLowerCase();
 const SCRUBBER_API_KEY = process.env.SCRUBBER_API_KEY || '';
+const SCRUBBER_ADMIN_KEY = process.env.SCRUBBER_ADMIN_KEY || '';
+const SCRUBBER_AUDIT_ENABLED = (process.env.SCRUBBER_AUDIT_ENABLED || 'true').toLowerCase() !== 'false';
+const SCRUBBER_AUDIT_BUFFER = parseInt(process.env.SCRUBBER_AUDIT_BUFFER || '0', 10);
+const SCRUBBER_AUDIT_RETENTION_DAYS = parseInt(process.env.SCRUBBER_AUDIT_RETENTION_DAYS || '90', 10);
 const RATE_LIMIT_TOKENS_PER_SECOND = 1000;
 const RATE_LIMIT_CAPACITY = 1000;
 const PUBLIC_PATHS = new Set(['/', '/health', '/metrics']);
@@ -35,22 +41,25 @@ const SCRUBBER_UPSTREAM_TIMEOUT = parseInt(process.env.SCRUBBER_UPSTREAM_TIMEOUT
 const SCRUBBER_CONNECTION_TIMEOUT = parseInt(process.env.SCRUBBER_CONNECTION_TIMEOUT || '5000', 10);
 const SCRUBBER_PROXY_ALLOW_PRIVATE = (process.env.SCRUBBER_PROXY_ALLOW_PRIVATE || 'false').toLowerCase() === 'true';
 const SCRUBBER_WS_MAX_CONNECTIONS = parseInt(process.env.SCRUBBER_WS_MAX_CONNECTIONS || '500', 10);
+const SCRUBBER_CLUSTER_WORKERS = parseInt(process.env.SCRUBBER_CLUSTER_WORKERS || '0', 10);
 const FORWARDED_REQUEST_HEADERS = new Set([
   'content-type', 'authorization', 'x-api-key', 'x-request-id', 'x-tenant-id', 'user-agent', 'accept', 'accept-language', 'cache-control',
 ]);
 const BLOCKED_REQUEST_HEADERS = new Set(['cookie', 'set-cookie', 'host', 'transfer-encoding', 'connection', 'upgrade']);
 const BLOCKED_RESPONSE_HEADERS = new Set(['transfer-encoding', 'connection', 'upgrade']);
 
-if (!JWT_SECRET) {
-  logger.warn('SCRUBBER_JWT_SECRET unset — attestation JWTs disabled');
+if (!JWT_SECRET && !JWT_PRIMARY_KEY) {
+  logger.warn('SCRUBBER_JWT_SECRET and SCRUBBER_JWT_PRIMARY_KEY unset — attestation JWTs disabled');
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const DB_PATH = path.join(DATA_DIR, 'mappings.db');
+const TENANTS_DIR = path.join(DATA_DIR, 'tenants');
+const AUDIT_DB_PATH = path.join(DATA_DIR, 'audit.db');
 
-function openDb() {
-  const db = new Database(DB_PATH);
+function openDb(dbPath = DB_PATH) {
+  const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 5000');
   db.pragma('synchronous = NORMAL');
@@ -87,6 +96,99 @@ INSERT OR IGNORE INTO service_metrics (name, value) VALUES ('scrub_requests_tota
 `);
 }
 
+function runAuditMigrations(db) {
+  db.exec(`
+CREATE TABLE IF NOT EXISTS audit_events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL,
+  tenant_id TEXT,
+  client_ip TEXT,
+  request_id TEXT,
+  metadata TEXT,
+  prev_hash TEXT NOT NULL,
+  cur_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_event_type ON audit_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_events(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at);
+`);
+}
+
+function hashAuditCanonical(fields) {
+  return crypto.createHash('sha256').update(fields.join('||')).digest('hex');
+}
+
+function parseVerificationKeys() {
+  const keyMap = new Map();
+  if (JWT_SECRET) keyMap.set('hs256-legacy', JWT_SECRET);
+  if (JWT_PRIMARY_KEY) keyMap.set('hs256-primary', JWT_PRIMARY_KEY);
+  for (const part of JWT_VERIFICATION_KEYS_RAW.split(',')) {
+    const token = part.trim();
+    if (!token) continue;
+    const idx = token.indexOf(':');
+    if (idx <= 0) continue;
+    const kid = token.slice(0, idx).trim();
+    const secret = token.slice(idx + 1).trim();
+    if (!kid || !secret) continue;
+    keyMap.set(kid, secret);
+  }
+  return keyMap;
+}
+
+const VERIFICATION_KEYS = parseVerificationKeys();
+
+function parseJwtHeader(token) {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    return JSON.parse(Buffer.from(parts[0].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function verifyAttestationJwt(token) {
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+  const [h, p, s] = parts;
+  const signingInput = `${h}.${p}`;
+  const got = s;
+  const header = parseJwtHeader(token);
+  const tryKeys = [];
+  if (header && header.kid && VERIFICATION_KEYS.has(header.kid)) {
+    tryKeys.push(VERIFICATION_KEYS.get(header.kid));
+  } else {
+    for (const v of VERIFICATION_KEYS.values()) tryKeys.push(v);
+  }
+  for (const key of tryKeys) {
+    const sig = b64u(crypto.createHmac('sha256', key).update(signingInput).digest());
+    if (crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(got))) return true;
+  }
+  return false;
+}
+
+function getTenantId(req) {
+  const raw = req.headers['x-tenant-id'];
+  if (typeof raw !== 'string') return null;
+  const tenantId = raw.trim();
+  if (!tenantId) return null;
+  if (!/^[a-zA-Z0-9_-]{2,64}$/.test(tenantId)) return null;
+  return tenantId;
+}
+
+function tenantDbPath(tenantId) {
+  return path.join(TENANTS_DIR, tenantId, 'mappings.db');
+}
+
+function ensureTenantDb(tenantId) {
+  const tdir = path.join(TENANTS_DIR, tenantId);
+  fs.mkdirSync(tdir, { recursive: true });
+  const db = openDb(tenantDbPath(tenantId));
+  runMigrations(db);
+  db.close();
+}
+
 function gc(db) {
   const cutoff = Math.floor(Date.now() / 1000) - 30 * 86400;
   db.prepare('DELETE FROM mappings WHERE created_at < ?').run(cutoff);
@@ -97,6 +199,15 @@ function initPrimaryMaintenance() {
   runMigrations(primaryDb);
   gc(primaryDb);
   setInterval(() => gc(primaryDb), 6 * 3600 * 1000);
+  fs.mkdirSync(TENANTS_DIR, { recursive: true });
+
+  if (SCRUBBER_AUDIT_ENABLED) {
+    const adb = openDb(AUDIT_DB_PATH);
+    runAuditMigrations(adb);
+    const cutoff = Math.floor(Date.now() / 1000) - (SCRUBBER_AUDIT_RETENTION_DAYS * 86400);
+    adb.prepare("DELETE FROM audit_events WHERE strftime('%s', created_at) < ?").run(cutoff);
+    adb.close();
+  }
 }
 
 const RULE_PACKS = {};
@@ -302,6 +413,17 @@ function setScrubbedForwardResponseHeaders(res, headers) {
   }
 }
 
+function safeCloseWsSocket(ws, code, reason) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const validCode = Number.isInteger(code) && (code === 1000 || (code >= 3000 && code <= 4999));
+  const validReason = typeof reason === 'string';
+  if (validCode && validReason) {
+    ws.close(code, reason.slice(0, 123));
+    return;
+  }
+  ws.close();
+}
+
 function scrubSseText(raw, rules, wantReversible, db) {
   const lines = raw.split('\n');
   const out = [];
@@ -388,14 +510,16 @@ function sha256Hex(s) {
 }
 
 function issueAttestation(db, { inputHash, outputHash, mode }) {
-  if (!JWT_SECRET) return null;
+  const signingKid = JWT_PRIMARY_KEY ? 'hs256-primary' : (JWT_SECRET ? 'hs256-legacy' : null);
+  const signingSecret = signingKid === 'hs256-primary' ? JWT_PRIMARY_KEY : JWT_SECRET;
+  if (!signingKid || !signingSecret) return null;
   const jti = crypto.randomBytes(16).toString('hex');
   const iat = Math.floor(Date.now() / 1000);
   const exp = iat + JWT_TTL_SECONDS;
-  const header = { alg: 'HS256', typ: 'JWT' };
+  const header = { alg: 'HS256', typ: 'JWT', kid: signingKid };
   const payload = { jti, iat, exp, input_hash: inputHash, output_hash: outputHash, mode, engine_version: VERSION };
   const signingInput = `${b64u(JSON.stringify(header))}.${b64u(JSON.stringify(payload))}`;
-  const sig = crypto.createHmac('sha256', JWT_SECRET).update(signingInput).digest();
+  const sig = crypto.createHmac('sha256', signingSecret).update(signingInput).digest();
   const token = `${signingInput}.${b64u(sig)}`;
   db.prepare(
     'INSERT OR REPLACE INTO attestations (jti, iat, exp, input_hash, output_hash, mode, engine_version) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -516,7 +640,60 @@ function createAuthMiddleware() {
 }
 
 function createApp() {
-  const db = openDb();
+  const defaultDb = openDb();
+  runMigrations(defaultDb);
+  const tenantDbCache = new Map();
+  const getDbForRequest = (req) => {
+    const tenantId = getTenantId(req);
+    if (!tenantId) return { db: defaultDb, tenantId: null };
+    const dbPath = tenantDbPath(tenantId);
+    if (!fs.existsSync(dbPath)) return { db: null, tenantId };
+    let db = tenantDbCache.get(tenantId);
+    if (!db) {
+      db = openDb(dbPath);
+      runMigrations(db);
+      tenantDbCache.set(tenantId, db);
+    }
+    return { db, tenantId };
+  };
+
+  const auditDb = SCRUBBER_AUDIT_ENABLED ? openDb(AUDIT_DB_PATH) : null;
+  if (auditDb) runAuditMigrations(auditDb);
+  const auditBuffer = [];
+  function writeAuditEvent(event) {
+    if (!auditDb) return;
+    const row = auditDb.prepare('SELECT cur_hash FROM audit_events ORDER BY seq DESC LIMIT 1').get();
+    const prevHash = row ? row.cur_hash : sha256Hex('genesis:scrubber-proxy-v0.5.0');
+    const metadataText = JSON.stringify(event.metadata || {});
+    const insert = auditDb.prepare('INSERT INTO audit_events (event_type, tenant_id, client_ip, request_id, metadata, prev_hash, cur_hash) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    const info = insert.run(event.event_type, event.tenant_id || null, event.client_ip || null, event.request_id || null, metadataText, prevHash, '__tmp__');
+    const seq = info.lastInsertRowid;
+    const curHash = hashAuditCanonical([
+      String(seq),
+      String(event.event_type || ''),
+      String(event.tenant_id || ''),
+      String(event.client_ip || ''),
+      String(event.request_id || ''),
+      metadataText,
+      prevHash,
+    ]);
+    auditDb.prepare('UPDATE audit_events SET cur_hash = ? WHERE seq = ?').run(curHash, seq);
+  }
+  function emitAuditEvent(event) {
+    if (!auditDb) return;
+    if (SCRUBBER_AUDIT_BUFFER > 0) {
+      auditBuffer.push(event);
+      if (auditBuffer.length >= SCRUBBER_AUDIT_BUFFER) {
+        const tx = auditDb.transaction((entries) => {
+          for (const entry of entries) writeAuditEvent(entry);
+        });
+        tx(auditBuffer.splice(0, auditBuffer.length));
+      }
+      return;
+    }
+    writeAuditEvent(event);
+  }
+
   const metrics = makeMetrics();
   const app = express();
 
@@ -541,7 +718,7 @@ function createApp() {
   });
 
   app.get('/metrics', async (req, res) => {
-    const globalScrubRequests = readGlobalScrubRequestsTotal(db);
+    const globalScrubRequests = readGlobalScrubRequestsTotal(defaultDb);
     const legacyLines = [
       '# HELP scrub_requests_total Total /scrub requests processed.',
       '# TYPE scrub_requests_total counter',
@@ -553,6 +730,9 @@ function createApp() {
   });
 
   async function handleScrub(req, res) {
+    const scope = getDbForRequest(req);
+    if (!scope.db) return res.status(404).json({ error: 'tenant_not_found' });
+    const db = scope.db;
     const body = req.body || {};
     const rules = parseRules(req.originalUrl || req.url);
     const wantReversible = body.reversible === true;
@@ -580,7 +760,7 @@ function createApp() {
     }
 
     const elapsed = Number(process.hrtime.bigint() - t0) / 1e9;
-    incrementGlobalScrubRequestsTotal(db);
+    incrementGlobalScrubRequestsTotal(defaultDb);
     metrics.scrubLatencySeconds.observe(elapsed);
     for (const d of detections) {
       metrics.detectionsTotal.labels(d.category, d.pack).inc();
@@ -590,6 +770,13 @@ function createApp() {
     const inputHash = sha256Hex(inputRaw);
     const outputHash = sha256Hex(sanitizedPayload);
     const att = issueAttestation(db, { inputHash, outputHash, mode });
+    emitAuditEvent({
+      event_type: 'scrub',
+      tenant_id: scope.tenantId,
+      client_ip: getClientIp(req),
+      request_id: req.headers['x-request-id'] || null,
+      metadata: { detections: detections.length, rules_applied: rules, text_length: String(inputRaw).length },
+    });
 
     return res.status(200).json({
       ...result,
@@ -641,6 +828,9 @@ function createApp() {
 
   app.post('/proxy', async (req, res, next) => {
     try {
+      const scope = getDbForRequest(req);
+      if (!scope.db) return res.status(404).json({ error: 'tenant_not_found' });
+      const db = scope.db;
       const qs = new URL(req.originalUrl || req.url, 'http://x').searchParams;
       const target = qs.get('target');
       const scrubResponse = (qs.get('scrub_response') || 'false').toLowerCase() === 'true';
@@ -668,6 +858,7 @@ function createApp() {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), SCRUBBER_UPSTREAM_TIMEOUT);
       let upstream;
+      const proxyStartedAt = Date.now();
       try {
         upstream = await fetch(safe.url.toString(), {
           method: req.method,
@@ -696,6 +887,13 @@ function createApp() {
       }
 
       metrics.scrubProxyRequestsTotal.inc();
+      emitAuditEvent({
+        event_type: 'proxy',
+        tenant_id: scope.tenantId,
+        client_ip: getClientIp(req),
+        request_id: req.headers['x-request-id'] || null,
+        metadata: { target: safe.url.toString(), status_code: upstream.status, duration_ms: Date.now() - proxyStartedAt },
+      });
       res.status(upstream.status);
       if (scrubResponse) setScrubbedForwardResponseHeaders(res, upstream.headers);
       else setForwardResponseHeaders(res, upstream.headers);
@@ -727,6 +925,9 @@ function createApp() {
   });
 
   app.get('/v1/attestations/:jti', (req, res) => {
+    const scope = getDbForRequest(req);
+    if (!scope.db) return res.status(404).json({ error: 'tenant_not_found' });
+    const db = scope.db;
     const jti = req.params.jti;
     if (!jti || !/^[a-f0-9]{32}$/.test(jti)) return res.status(400).json({ error: 'bad_jti' });
     const row = getAttestation(db, jti);
@@ -736,6 +937,9 @@ function createApp() {
   });
 
   app.post('/reverse', (req, res) => {
+    const scope = getDbForRequest(req);
+    if (!scope.db) return res.status(404).json({ error: 'tenant_not_found' });
+    const db = scope.db;
     const body = req.body || {};
     if (!body.mapping_id || !body.token) {
       return res.status(400).json({ error: 'mapping_id and token required' });
@@ -743,6 +947,112 @@ function createApp() {
     const original = reverseMapping(db, body.mapping_id, body.token);
     if (original === null) return res.status(404).json({ error: 'not_found' });
     return res.status(200).json({ original });
+  });
+
+  app.get('/v1/jwks.json', (req, res) => {
+    const keys = [];
+    if (JWT_SECRET || VERIFICATION_KEYS.has('hs256-legacy')) {
+      keys.push({ kid: 'hs256-legacy', kty: 'oct', alg: 'HS256', use: 'sig' });
+    }
+    if (JWT_PRIMARY_KEY || VERIFICATION_KEYS.has('hs256-primary')) {
+      keys.push({ kid: 'hs256-primary', kty: 'oct', alg: 'HS256', use: 'sig' });
+    }
+    return res.status(200).json({ keys });
+  });
+
+  function requireAdmin(req, res, next) {
+    if (!SCRUBBER_ADMIN_KEY) return res.status(503).json({ error: 'admin_misconfigured' });
+    const key = req.headers['x-scrubber-admin-key'];
+    if (typeof key === 'string' && key === SCRUBBER_ADMIN_KEY) return next();
+    emitAuditEvent({ event_type: 'auth_failure', tenant_id: null, client_ip: getClientIp(req), request_id: req.headers['x-request-id'] || null, metadata: { reason: 'bad_admin_key' } });
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  app.post('/admin/tenants', requireAdmin, (req, res) => {
+    const body = req.body || {};
+    const tenantId = typeof body.tenant_id === 'string' ? body.tenant_id.trim() : '';
+    if (!/^[a-zA-Z0-9_-]{2,64}$/.test(tenantId)) return res.status(400).json({ error: 'bad_tenant_id' });
+    ensureTenantDb(tenantId);
+    emitAuditEvent({ event_type: 'tenant_create', tenant_id: tenantId, client_ip: getClientIp(req), request_id: req.headers['x-request-id'] || null, metadata: { allowed_rules: body.allowed_rules || [], rate_limit_rps: body.rate_limit_rps || null } });
+    return res.status(201).json({ tenant_id: tenantId, created_at: new Date().toISOString() });
+  });
+
+  app.get('/admin/tenants', requireAdmin, (req, res) => {
+    fs.mkdirSync(TENANTS_DIR, { recursive: true });
+    const tenants = fs.readdirSync(TENANTS_DIR, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+    return res.status(200).json({ tenants });
+  });
+
+  app.delete('/admin/tenants/:id', requireAdmin, (req, res) => {
+    const tenantId = req.params.id;
+    if (!/^[a-zA-Z0-9_-]{2,64}$/.test(tenantId)) return res.status(400).json({ error: 'bad_tenant_id' });
+    if ((req.headers['x-confirm-delete'] || '') !== `delete:${tenantId}`) return res.status(400).json({ error: 'confirmation_required' });
+    const tdir = path.join(TENANTS_DIR, tenantId);
+    if (!fs.existsSync(tdir)) return res.status(404).json({ error: 'not_found' });
+    fs.rmSync(tdir, { recursive: true, force: true });
+    tenantDbCache.delete(tenantId);
+    return res.status(200).json({ deleted: tenantId });
+  });
+
+  app.get('/v1/audit/verify', (req, res) => {
+    if (!auditDb) return res.status(200).json({ valid: true, length: 0, head: null });
+    const tenant = typeof req.query.tenant === 'string' ? req.query.tenant : null;
+    const rows = tenant
+      ? auditDb.prepare('SELECT seq,event_type,tenant_id,client_ip,request_id,metadata,prev_hash,cur_hash FROM audit_events WHERE tenant_id = ? ORDER BY seq ASC').all(tenant)
+      : auditDb.prepare('SELECT seq,event_type,tenant_id,client_ip,request_id,metadata,prev_hash,cur_hash FROM audit_events ORDER BY seq ASC').all();
+    let expectedPrev = sha256Hex('genesis:scrubber-proxy-v0.5.0');
+    for (let i = 0; i < rows.length; i += 1) {
+      const row = rows[i];
+      if (row.prev_hash !== expectedPrev) {
+        return res.status(200).json({ valid: false, broken_at: row.seq, expected: expectedPrev, got: row.prev_hash });
+      }
+      const expectedCur = hashAuditCanonical([String(row.seq), String(row.event_type || ''), String(row.tenant_id || ''), String(row.client_ip || ''), String(row.request_id || ''), String(row.metadata || '{}'), String(row.prev_hash || '')]);
+      if (row.cur_hash !== expectedCur) {
+        return res.status(200).json({ valid: false, broken_at: row.seq, expected: expectedCur, got: row.cur_hash });
+      }
+      expectedPrev = row.cur_hash;
+    }
+    return res.status(200).json({ valid: true, length: rows.length, head: rows.length ? rows[rows.length - 1].cur_hash : null });
+  });
+
+  app.get('/v1/audit', requireAdmin, (req, res) => {
+    if (!auditDb) return res.status(200).json({ events: [], total: 0 });
+    const eventType = typeof req.query.event_type === 'string' ? req.query.event_type : null;
+    const tenant = typeof req.query.tenant === 'string' ? req.query.tenant : null;
+    const since = typeof req.query.since === 'string' ? req.query.since : null;
+    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit || '100', 10)));
+    const offset = Math.max(0, parseInt(req.query.offset || '0', 10));
+    const clauses = [];
+    const args = [];
+    if (eventType) { clauses.push('event_type = ?'); args.push(eventType); }
+    if (tenant) { clauses.push('tenant_id = ?'); args.push(tenant); }
+    if (since) { clauses.push('created_at >= ?'); args.push(since); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const total = auditDb.prepare(`SELECT COUNT(*) AS c FROM audit_events ${where}`).get(...args).c;
+    const events = auditDb.prepare(`SELECT * FROM audit_events ${where} ORDER BY seq DESC LIMIT ? OFFSET ?`).all(...args, limit, offset);
+    return res.status(200).json({ events, total, limit, offset });
+  });
+
+  app.get('/v1/audit/export', requireAdmin, (req, res) => {
+    if (!auditDb) {
+      res.setHeader('content-type', 'text/csv; charset=utf-8');
+      return res.status(200).send('seq,event_type,tenant_id,client_ip,request_id,metadata,prev_hash,cur_hash,created_at\n');
+    }
+    const tenant = typeof req.query.tenant === 'string' ? req.query.tenant : null;
+    const since = typeof req.query.since === 'string' ? req.query.since : null;
+    const clauses = [];
+    const args = [];
+    if (tenant) { clauses.push('tenant_id = ?'); args.push(tenant); }
+    if (since) { clauses.push('created_at >= ?'); args.push(since); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = auditDb.prepare(`SELECT * FROM audit_events ${where} ORDER BY seq ASC`).all(...args);
+    res.setHeader('content-type', 'text/csv; charset=utf-8');
+    let csv = 'seq,event_type,tenant_id,client_ip,request_id,metadata,prev_hash,cur_hash,created_at\n';
+    for (const r of rows) {
+      const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+      csv += [r.seq, esc(r.event_type), esc(r.tenant_id), esc(r.client_ip), esc(r.request_id), esc(r.metadata), esc(r.prev_hash), esc(r.cur_hash), esc(r.created_at)].join(',') + '\n';
+    }
+    return res.status(200).send(csv);
   });
 
   app.use((req, res) => {
@@ -754,7 +1064,7 @@ function createApp() {
     return res.status(500).json({ error: String((err && err.message) || err) });
   });
 
-  return { app, metrics, db };
+  return { app, metrics, db: defaultDb, verifyAttestationJwt };
 }
 
 function startWorker() {
@@ -881,10 +1191,10 @@ function startWorker() {
           });
 
           client.on('close', (code, reason) => {
-            if (upstream.readyState === WebSocket.OPEN) upstream.close(code, reason);
+            safeCloseWsSocket(upstream, code, reason);
           });
           upstream.on('close', (code, reason) => {
-            if (client.readyState === WebSocket.OPEN) client.close(code, reason);
+            safeCloseWsSocket(client, code, reason);
           });
 
           let settled = false;
@@ -959,7 +1269,7 @@ if (cluster.isPrimary) {
   });
 
   initPrimaryMaintenance();
-  const workerCount = os.cpus().length;
+  const workerCount = SCRUBBER_CLUSTER_WORKERS > 0 ? SCRUBBER_CLUSTER_WORKERS : os.cpus().length;
   logger.info({ workers: workerCount }, 'starting cluster');
   for (let i = 0; i < workerCount; i += 1) {
     cluster.fork();
