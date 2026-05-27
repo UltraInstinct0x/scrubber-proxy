@@ -14,9 +14,16 @@ jobs:
     name: deploy to scrubber.goku.codes
     runs-on: [self-hosted, panel-prod]
     timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash -lc {0}
+    env:
+      NVM_DIR: /home/ubuntu/.nvm
     steps:
       - name: pull latest
         run: |
+          source "$NVM_DIR/nvm.sh"
+          nvm use 22 >/dev/null
           cd "$HOME/scrubber-proxy"
           git fetch --prune origin
           git checkout main
@@ -25,6 +32,9 @@ jobs:
 
       - name: install dependencies
         run: |
+          source "$NVM_DIR/nvm.sh"
+          nvm use 22 >/dev/null
+          node -v
           cd "$HOME/scrubber-proxy"
           npm ci --omit=dev
 
