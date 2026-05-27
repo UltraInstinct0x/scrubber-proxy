@@ -1,12 +1,14 @@
 {
   "name": "scrubber-proxy",
-  "version": "0.5.0",
-  "description": "PII/secret scrubber HTTP service — regex + dictionary, reversible mapping store.",
+  "version": "0.6.0",
+  "description": "PII/secret scrubber HTTP service \u2014 regex + dictionary, reversible mapping store.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "test": "node test.js"
+    "test": "node test.js && node tests/run_tiers.js",
+    "test:tiers": "node tests/run_tiers.js",
+    "test:tiers:remote": "node tests/run_tiers.js --remote"
   },
   "license": "MIT",
   "dependencies": {

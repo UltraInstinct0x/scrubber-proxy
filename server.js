@@ -23,7 +23,7 @@ const DATA_DIR = process.env.SCRUBBER_DATA_DIR || path.join(__dirname, 'data');
 const RULES_DIR = path.join(__dirname, 'rules');
 const REVERSAL_KEY_RAW = process.env.SCRUBBER_REVERSAL_KEY || 'dev-key-do-not-use-in-prod-dev-key-do-not-use-in-prod';
 const REVERSAL_KEY = crypto.createHash('sha256').update(REVERSAL_KEY_RAW).digest();
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 const JWT_SECRET = process.env.SCRUBBER_JWT_SECRET || '';
 const JWT_PRIMARY_KEY = process.env.SCRUBBER_JWT_PRIMARY_KEY || '';
 const JWT_VERIFICATION_KEYS_RAW = process.env.SCRUBBER_JWT_VERIFICATION_KEYS || '';
@@ -221,44 +221,7 @@ function loadRules() {
 }
 loadRules();
 
-const VALIDATORS = {
-  luhn(s) {
-    const d = s.replace(/[^0-9]/g, '');
-    if (d.length < 13 || d.length > 19) return false;
-    let sum = 0; let alt = false;
-    for (let i = d.length - 1; i >= 0; i--) {
-      let n = parseInt(d[i], 10);
-      if (alt) { n *= 2; if (n > 9) n -= 9; }
-      sum += n; alt = !alt;
-    }
-    return sum % 10 === 0;
-  },
-  tckn(s) {
-    if (!/^\d{11}$/.test(s)) return false;
-    const d = s.split('').map(Number);
-    if (d[0] === 0) return false;
-    const oddSum = d[0] + d[2] + d[4] + d[6] + d[8];
-    const evenSum = d[1] + d[3] + d[5] + d[7];
-    const c10 = ((oddSum * 7) - evenSum) % 10;
-    const c11 = (oddSum + evenSum + d[9]) % 10;
-    return ((c10 + 10) % 10) === d[9] && c11 === d[10];
-  },
-  iban_mod97(s) {
-    const c = s.replace(/\s+/g, '').toUpperCase();
-    if (c.length < 15 || c.length > 34) return false;
-    const re = c.slice(4) + c.slice(0, 4);
-    let num = '';
-    for (const ch of re) {
-      const code = ch.charCodeAt(0);
-      if (code >= 48 && code <= 57) num += ch;
-      else if (code >= 65 && code <= 90) num += (code - 55).toString();
-      else return false;
-    }
-    let rem = 0;
-    for (const ch of num) rem = (rem * 10 + parseInt(ch, 10)) % 97;
-    return rem === 1;
-  },
-};
+const VALIDATORS = require('./server.validators.js');
 
 function makeMetrics() {
   const register = new Registry();
@@ -451,7 +414,8 @@ function scrubText(text, ruleNames, mappingId, db) {
   for (const name of ordered) {
     const pack = RULE_PACKS[name];
     if (!pack) continue;
-    for (const rule of pack.rules) {
+    const sorted = [...pack.rules].sort((a, b) => (a.priority ?? 1000) - (b.priority ?? 1000));
+    for (const rule of sorted) {
       const re = new RegExp(rule.pattern, rule.flags || 'g');
       out = out.replace(re, (match) => {
         if (rule.validator && VALIDATORS[rule.validator] && !VALIDATORS[rule.validator](match)) {
@@ -459,7 +423,7 @@ function scrubText(text, ruleNames, mappingId, db) {
         }
         counters[rule.token] = (counters[rule.token] || 0) + 1;
         const placeholder = `<${rule.token}_${counters[rule.token]}>`;
-        detections.push({ token: placeholder, category: rule.token, pack: name });
+        detections.push({ token: placeholder, category: rule.category || rule.token, pack: name });
         if (mappingId) storeMapping(db, mappingId, placeholder, match);
         return placeholder;
       });

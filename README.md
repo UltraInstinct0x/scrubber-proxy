@@ -1,4 +1,4 @@
-# scrubber-proxy v0.5.0
+# scrubber-proxy v0.6.0
 
 PII/secret scrubber HTTP service. Regex + dictionary. No LLM, no hallucinated detections. Reversible by design (encrypted sqlite mapping store). Clustered, authenticated, metered.
 
@@ -34,6 +34,22 @@ Signing key: `SCRUBBER_JWT_SECRET` (HS256, 32 bytes hex). Lives in `~/.secrets/s
 Verification roundtrip: `GET /v1/attestations/:jti` → `{jti, iat, exp, input_hash, output_hash, mode, engine_version, valid}`.
 
 The `output_hash` is the critical bit — without checking it on the consumer side, the JWT degrades into a generic bearer token replayable across any payload.
+
+## v0.6.0 — enterprise tier guarantees
+
+The scrubber now ships with an explicit per-tier reliability contract, gated by a corpus harness in CI.
+
+| Tier | Promise | What it covers |
+|------|---------|----------------|
+| L1 vendor secrets   | **100%** | OpenAI, Anthropic, GitHub PAT (classic + fine-grained), Stripe, Slack, AWS, Google, HuggingFace, Supabase, Notion, Linear, Twilio, SendGrid, Mailgun, Postmark, Shopify, Square, Heroku, DigitalOcean, NPM, PyPI, Docker, GitLab, JWT, PEM blocks |
+| L2 structured IDs   | **100%** | Credit cards (Luhn), SSN, IPv4 |
+| L3 env-var sweep    | **100%** | `<NAME>_KEY|TOKEN|SECRET|PASSWORD|...` = value, including quoted values with spaces |
+| L4 contact          | **100%** | Email, URLs with token/key/secret/sig/auth/session query parameters |
+| L5 free-form PII    | best-effort | Phone numbers, prose names |
+
+Patterns are evaluated **specific → generic** via an explicit `priority` field, so vendor prefixes always fire before broad sweepers and broad regex (phone, env sweep) can't shadow them.
+
+Each tier is locked by a fixture corpus in `tests/corpus/<tier>/`. `npm run test:tiers` runs offline in-process; `npm run test:tiers:remote -- https://host` exercises a live instance. CI hard-fails the deploy job if any promised tier drops below 100%, both pre-deploy (offline) and post-deploy (against prod).
 
 ## v0.5.0 — enterprise upgrades
 
