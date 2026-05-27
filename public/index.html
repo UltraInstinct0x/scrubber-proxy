@@ -220,7 +220,7 @@
     async function loadVersion() {
       const badge = document.getElementById('versionBadge');
       try {
-        const r = await fetch('/healthz');
+        const r = await fetch('/health');
         if (!r.ok) throw new Error();
         const data = await r.json();
         badge.textContent = data.version ? `v${data.version}` : 'live';
