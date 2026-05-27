@@ -1,0 +1,57 @@
+{
+  "tiers": {
+    "L1_secrets": {
+      "target": "100%",
+      "files": [
+        "openai_keys.txt",
+        "anthropic_key.txt",
+        "github_tokens.txt",
+        "stripe_keys.txt",
+        "slack_bundle.txt",
+        "google_key.txt",
+        "aws_keys.txt",
+        "hf_token.txt",
+        "supabase_key.txt",
+        "twilio_keys.txt",
+        "sendgrid_key.txt",
+        "jwt_token.txt",
+        "pem_block.txt",
+        "npm_token.txt",
+        "gitlab_pat.txt",
+        "telegram_token.txt",
+        "digitalocean_token.txt",
+        "dockerhub_pat.txt"
+      ]
+    },
+    "L2_structured": {
+      "target": "100%",
+      "files": [
+        "credit_card_valid.txt",
+        "credit_card_invalid.txt",
+        "ssn.txt",
+        "ipv4.txt"
+      ]
+    },
+    "L3_env": {
+      "target": "100%",
+      "files": [
+        "custom_env.txt"
+      ]
+    },
+    "L4_contact": {
+      "target": "100%",
+      "files": [
+        "email.txt",
+        "url_token.txt"
+      ]
+    },
+    "negatives": {
+      "target": "100%",
+      "files": [
+        "uuid.txt",
+        "git_sha.txt",
+        "plain_prose.txt"
+      ]
+    }
+  }
+}

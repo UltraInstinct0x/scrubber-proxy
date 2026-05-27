@@ -1,0 +1,7 @@
+{
+  "L1_secrets":    { "target": "100%", "label": "Vendor secrets" },
+  "L2_structured": { "target": "100%", "label": "Structured IDs (checksummed)" },
+  "L3_env":        { "target": "100%", "label": "Env-var sweep" },
+  "L4_contact":    { "target": "100%", "label": "Email + URL-with-token" },
+  "negatives":     { "target": "100%", "label": "Negative corpus (no false positives)" }
+}

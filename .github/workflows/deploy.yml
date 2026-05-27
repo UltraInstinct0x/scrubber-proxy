@@ -10,8 +10,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  tier_gate:
+    name: enterprise tier gate (100% promised tiers)
+    runs-on: [self-hosted, panel-prod]
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: /bin/bash -leo pipefail {0}
+    env:
+      NVM_DIR: /home/ubuntu/.nvm
+    steps:
+      - name: checkout
+        run: |
+          source "$NVM_DIR/nvm.sh"
+          nvm use 22 >/dev/null
+          WORK="$RUNNER_TEMP/scrubber-gate-$GITHUB_SHA"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          git clone --depth 1 --branch "${GITHUB_REF_NAME:-main}" "https://github.com/${GITHUB_REPOSITORY}.git" "$WORK"
+          echo "WORK=$WORK" >> $GITHUB_ENV
+
+      - name: install (offline harness needs no native deps)
+        run: |
+          source "$NVM_DIR/nvm.sh"
+          nvm use 22 >/dev/null
+          cd "$WORK"
+          npm install --omit=optional --no-audit --no-fund || true
+
+      - name: run tier corpus (offline, in-process)
+        run: |
+          source "$NVM_DIR/nvm.sh"
+          nvm use 22 >/dev/null
+          cd "$WORK"
+          node tests/run_tiers.js
+
   deploy:
     name: deploy to scrubber.goku.codes
+    needs: tier_gate
     runs-on: [self-hosted, panel-prod]
     timeout-minutes: 5
     defaults:
@@ -51,3 +86,10 @@ jobs:
           curl -sf -X POST https://scrubber.goku.codes/scrub?rules=base \
             -H 'content-type: application/json' \
             -d '{"text":"test@example.com"}' | grep EMAIL
+
+      - name: post-deploy tier verification against live prod
+        run: |
+          source "$NVM_DIR/nvm.sh"
+          nvm use 22 >/dev/null
+          cd "$HOME/scrubber-proxy"
+          node tests/run_tiers.js --remote https://scrubber.goku.codes
