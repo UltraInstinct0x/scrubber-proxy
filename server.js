@@ -278,7 +278,6 @@ function forwardRequestHeaders(headers) {
     if (lk.startsWith('x-scrubber-')) continue;
     if (BLOCKED_REQUEST_HEADERS.has(lk)) continue;
     if (!FORWARDED_REQUEST_HEADERS.has(lk)) continue;
-    if (lk === 'accept-encoding') continue;
     out[lk] = val;
   }
   return out;
