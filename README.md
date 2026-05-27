@@ -8,11 +8,10 @@ Consumer #1: [panel](https://panel.goku.codes) — sanitizes technical-pool unit
 
 POST text or an agent trace; returns the same body with PII/secrets replaced by typed tokens (`<EMAIL_1>`, `<PHONE_1>`, `<TCKN_1>`, ...). Optionally reversible if you pass `reversible: true` — get back a `mapping_id`, store it, later POST `/reverse` to recover the original.
 
-## what it doesn't do (v0)
+## what it doesn't do
 
-- **not magic.** regex + dictionary recall, not 100%. treat as defense-in-depth, not a guarantee.
-- **no NLP / NER.** doesn't catch novel name patterns or context-dependent PII. add a rule pack or post-process if you need that.
-- **no irreversibility.** mappings are stored encrypted under a static env key. that's a *feature* for audit/legal-hold, document it honestly to your buyers.
+- **L5 free-form PII is best-effort, not 100%.** novel name patterns, context-dependent PII, and prose-only identifiers require NER and aren't promised. add a rule pack or post-process if you need that. (L1–L4 *are* 100%-promised and gated in CI — see the v0.6.0 tier contract above.)
+- **reversible by design.** mappings are stored encrypted under a static env key. that's a *feature* for audit/legal-hold; document it honestly to your buyers.
 - **symmetric HS256 key management only.** v0.5 adds `kid` rotation with env-managed keys; KMS-backed key management remains future work.
 
 ## attestation tokens (v0.2)
