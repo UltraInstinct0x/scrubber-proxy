@@ -3,13 +3,17 @@
 
 const cluster = require('cluster');
 const os = require('os');
+const http = require('http');
+const dns = require('dns').promises;
+const net = require('net');
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 const pino = require('pino');
-const { Registry, collectDefaultMetrics, Counter, Histogram } = require('prom-client');
+const { Registry, collectDefaultMetrics, Counter, Histogram, Gauge } = require('prom-client');
+const { WebSocket, WebSocketServer } = require('ws');
 
 const logger = pino({ name: 'scrubber-proxy' });
 
@@ -19,7 +23,7 @@ const DATA_DIR = process.env.SCRUBBER_DATA_DIR || path.join(__dirname, 'data');
 const RULES_DIR = path.join(__dirname, 'rules');
 const REVERSAL_KEY_RAW = process.env.SCRUBBER_REVERSAL_KEY || 'dev-key-do-not-use-in-prod-dev-key-do-not-use-in-prod';
 const REVERSAL_KEY = crypto.createHash('sha256').update(REVERSAL_KEY_RAW).digest();
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const JWT_SECRET = process.env.SCRUBBER_JWT_SECRET || '';
 const JWT_TTL_SECONDS = 300;
 const SCRUBBER_AUTH = (process.env.SCRUBBER_AUTH || 'key').toLowerCase();
@@ -27,6 +31,15 @@ const SCRUBBER_API_KEY = process.env.SCRUBBER_API_KEY || '';
 const RATE_LIMIT_TOKENS_PER_SECOND = 1000;
 const RATE_LIMIT_CAPACITY = 1000;
 const PUBLIC_PATHS = new Set(['/', '/health', '/metrics']);
+const SCRUBBER_UPSTREAM_TIMEOUT = parseInt(process.env.SCRUBBER_UPSTREAM_TIMEOUT || '30000', 10);
+const SCRUBBER_CONNECTION_TIMEOUT = parseInt(process.env.SCRUBBER_CONNECTION_TIMEOUT || '5000', 10);
+const SCRUBBER_PROXY_ALLOW_PRIVATE = (process.env.SCRUBBER_PROXY_ALLOW_PRIVATE || 'false').toLowerCase() === 'true';
+const SCRUBBER_WS_MAX_CONNECTIONS = parseInt(process.env.SCRUBBER_WS_MAX_CONNECTIONS || '500', 10);
+const FORWARDED_REQUEST_HEADERS = new Set([
+  'content-type', 'authorization', 'x-api-key', 'x-request-id', 'x-tenant-id', 'user-agent', 'accept', 'accept-language', 'cache-control',
+]);
+const BLOCKED_REQUEST_HEADERS = new Set(['cookie', 'set-cookie', 'host', 'transfer-encoding', 'connection', 'upgrade']);
+const BLOCKED_RESPONSE_HEADERS = new Set(['transfer-encoding', 'connection', 'upgrade']);
 
 if (!JWT_SECRET) {
   logger.warn('SCRUBBER_JWT_SECRET unset — attestation JWTs disabled');
@@ -151,7 +164,160 @@ function makeMetrics() {
     buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
     registers: [register],
   });
-  return { register, detectionsTotal, scrubLatencySeconds };
+  const scrubProxyRequestsTotal = new Counter({
+    name: 'scrub_proxy_requests_total',
+    help: 'Total /proxy requests processed.',
+    registers: [register],
+  });
+  const scrubWsActiveConnections = new Gauge({
+    name: 'scrub_ws_active_connections',
+    help: 'Current active websocket proxy connections.',
+    registers: [register],
+  });
+  const scrubWsFramesProcessedTotal = new Counter({
+    name: 'scrub_ws_frames_processed_total',
+    help: 'Total websocket frames processed by direction.',
+    labelNames: ['direction'],
+    registers: [register],
+  });
+  const scrubWsBytesScrubbedTotal = new Counter({
+    name: 'scrub_ws_bytes_scrubbed_total',
+    help: 'Total websocket bytes scrubbed by direction.',
+    labelNames: ['direction'],
+    registers: [register],
+  });
+  return {
+    register,
+    detectionsTotal,
+    scrubLatencySeconds,
+    scrubProxyRequestsTotal,
+    scrubWsActiveConnections,
+    scrubWsFramesProcessedTotal,
+    scrubWsBytesScrubbedTotal,
+  };
+}
+
+function isPrivateIp(ip) {
+  if (net.isIP(ip) === 4) {
+    const parts = ip.split('.').map((v) => parseInt(v, 10));
+    if (parts[0] === 10) return true;
+    if (parts[0] === 127) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    return false;
+  }
+  if (net.isIP(ip) === 6) {
+    const s = ip.toLowerCase();
+    if (s === '::1') return true;
+    if (s.startsWith('fe80:')) return true;
+    if (s.startsWith('fc') || s.startsWith('fd')) return true;
+    return false;
+  }
+  return false;
+}
+
+function normalizeIp(ip) {
+  if (typeof ip !== 'string') return ip;
+  const s = ip.toLowerCase();
+  if (s.startsWith('::ffff:')) {
+    return s.slice(7);
+  }
+  return ip;
+}
+
+async function assertSafeTarget(target) {
+  let u;
+  try {
+    u = new URL(target);
+  } catch {
+    const err = new Error('bad_target');
+    err.code = 'bad_target';
+    throw err;
+  }
+  if (!['http:', 'https:', 'ws:', 'wss:'].includes(u.protocol)) {
+    const err = new Error('bad_target');
+    err.code = 'bad_target';
+    throw err;
+  }
+  const host = u.hostname;
+  if (SCRUBBER_PROXY_ALLOW_PRIVATE) {
+    const resolved = net.isIP(host) ? [{ address: normalizeIp(host), family: net.isIP(host) }] : await dns.lookup(host, { all: true, verbatim: true });
+    if (!resolved.length) {
+      const err = new Error('bad_target');
+      err.code = 'bad_target';
+      throw err;
+    }
+    return { url: u, pinnedAddress: normalizeIp(resolved[0].address), family: resolved[0].family };
+  }
+  if (net.isIP(host) && isPrivateIp(normalizeIp(host))) {
+    const err = new Error('ssrf_blocked');
+    err.code = 'ssrf_blocked';
+    throw err;
+  }
+  const addrs = await dns.lookup(host, { all: true, verbatim: true });
+  if (!addrs.length) {
+    const err = new Error('bad_target');
+    err.code = 'bad_target';
+    throw err;
+  }
+  for (const entry of addrs) {
+    if (isPrivateIp(normalizeIp(entry.address))) {
+      const err = new Error('ssrf_blocked');
+      err.code = 'ssrf_blocked';
+      throw err;
+    }
+  }
+  return { url: u, pinnedAddress: normalizeIp(addrs[0].address), family: addrs[0].family };
+}
+
+function forwardRequestHeaders(headers) {
+  const out = {};
+  for (const [key, val] of Object.entries(headers || {})) {
+    const lk = String(key).toLowerCase();
+    if (lk.startsWith('x-scrubber-')) continue;
+    if (BLOCKED_REQUEST_HEADERS.has(lk)) continue;
+    if (!FORWARDED_REQUEST_HEADERS.has(lk)) continue;
+    out[lk] = val;
+  }
+  return out;
+}
+
+function setForwardResponseHeaders(res, headers) {
+  for (const [key, val] of headers.entries()) {
+    const lk = key.toLowerCase();
+    if (lk.startsWith('x-scrubber-')) continue;
+    if (BLOCKED_RESPONSE_HEADERS.has(lk)) continue;
+    res.setHeader(key, val);
+  }
+}
+
+function setScrubbedForwardResponseHeaders(res, headers) {
+  for (const [key, val] of headers.entries()) {
+    const lk = key.toLowerCase();
+    if (lk.startsWith('x-scrubber-')) continue;
+    if (BLOCKED_RESPONSE_HEADERS.has(lk)) continue;
+    if (lk === 'content-length' || lk === 'etag') continue;
+    res.setHeader(key, val);
+  }
+}
+
+function scrubSseText(raw, rules, wantReversible, db) {
+  const lines = raw.split('\n');
+  const out = [];
+  const responseMappingId = wantReversible ? crypto.randomBytes(12).toString('hex') : null;
+  let detections = [];
+  for (const line of lines) {
+    if (line.startsWith('data: ')) {
+      const payload = line.slice(6);
+      const r = scrubText(payload, rules, responseMappingId, db);
+      detections = detections.concat(r.detections);
+      out.push(`data: ${r.text}`);
+    } else {
+      out.push(line);
+    }
+  }
+  return { text: out.join('\n'), detections, mappingId: responseMappingId };
 }
 
 function scrubText(text, ruleNames, mappingId, db) {
@@ -303,6 +469,30 @@ function createRateLimiter() {
   };
 }
 
+function checkLocalRateLimit(buckets, ip) {
+  const now = Date.now() / 1000;
+  const current = buckets.get(ip) || { tokens: RATE_LIMIT_CAPACITY, last: now };
+  const elapsed = Math.max(0, now - current.last);
+  current.tokens = Math.min(RATE_LIMIT_CAPACITY, current.tokens + elapsed * RATE_LIMIT_TOKENS_PER_SECOND);
+  current.last = now;
+  if (current.tokens < 1) {
+    const retryAfter = Math.max(1, Math.ceil((1 - current.tokens) / RATE_LIMIT_TOKENS_PER_SECOND));
+    buckets.set(ip, current);
+    return { allowed: false, retryAfter };
+  }
+  current.tokens -= 1;
+  buckets.set(ip, current);
+  return { allowed: true, retryAfter: 0 };
+}
+
+function isAuthorized(req) {
+  if (SCRUBBER_AUTH === 'none') return true;
+  if (PUBLIC_PATHS.has(new URL(req.url || '/', 'http://x').pathname)) return true;
+  if (!SCRUBBER_API_KEY) return false;
+  const key = req.headers['x-scrubber-key'];
+  return typeof key === 'string' && key === SCRUBBER_API_KEY;
+}
+
 function readGlobalScrubRequestsTotal(db) {
   const row = db.prepare("SELECT value FROM service_metrics WHERE name = 'scrub_requests_total'").get();
   return row ? Number(row.value) : 0;
@@ -412,6 +602,114 @@ function createApp() {
     });
   }
 
+  async function scrubPayload(body, rules, db) {
+    const wantReversible = body && body.reversible === true;
+    const mappingId = wantReversible ? crypto.randomBytes(12).toString('hex') : null;
+    if (typeof body.text === 'string') {
+      const r = scrubText(body.text, rules, mappingId, db);
+      return {
+        result: { text: r.text, detections: r.detections },
+        detections: r.detections,
+        mode: 'text',
+        sanitizedPayload: r.text,
+        inputRaw: body.text,
+        mappingId,
+      };
+    }
+    if (Array.isArray(body.trace)) {
+      const r = scrubTrace(body.trace, rules, mappingId, db);
+      return {
+        result: { trace: r.trace, detections: r.detections },
+        detections: r.detections,
+        mode: 'trace',
+        sanitizedPayload: JSON.stringify(r.trace),
+        inputRaw: JSON.stringify(body.trace),
+        mappingId,
+      };
+    }
+    const raw = typeof body === 'string' ? body : JSON.stringify(body || {});
+    const r = scrubText(raw, rules, mappingId, db);
+    return {
+      result: { text: r.text, detections: r.detections },
+      detections: r.detections,
+      mode: 'text',
+      sanitizedPayload: r.text,
+      inputRaw: raw,
+      mappingId,
+    };
+  }
+
+  app.post('/proxy', async (req, res, next) => {
+    try {
+      const qs = new URL(req.originalUrl || req.url, 'http://x').searchParams;
+      const target = qs.get('target');
+      const scrubResponse = (qs.get('scrub_response') || 'false').toLowerCase() === 'true';
+      if (!target) return res.status(400).json({ error: 'target_required' });
+      const safe = await assertSafeTarget(target);
+      if (!['http:', 'https:'].includes(safe.url.protocol)) return res.status(400).json({ error: 'bad_target' });
+
+      const rules = parseRules(req.originalUrl || req.url);
+      const inputBody = req.body || {};
+      if (!(typeof inputBody.text === 'string' || Array.isArray(inputBody.trace))) {
+        return res.status(400).json({ error: 'body must include {text} or {trace:[]}' });
+      }
+      const scrubbedReq = await scrubPayload(inputBody, rules, db);
+      const reqInputHash = sha256Hex(scrubbedReq.inputRaw);
+      const reqOutputHash = sha256Hex(scrubbedReq.sanitizedPayload);
+      const reqAtt = issueAttestation(db, { inputHash: reqInputHash, outputHash: reqOutputHash, mode: scrubbedReq.mode });
+
+      const forwardedHeaders = forwardRequestHeaders(req.headers);
+      forwardedHeaders['x-scrubbed-by'] = 'scrubber-proxy';
+
+      const bodyForUpstream = typeof inputBody.text === 'string'
+        ? { ...inputBody, text: scrubbedReq.result.text }
+        : { ...inputBody, trace: scrubbedReq.result.trace };
+      const bodyText = JSON.stringify(bodyForUpstream);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), SCRUBBER_UPSTREAM_TIMEOUT);
+      let upstream;
+      try {
+        upstream = await fetch(safe.url.toString(), {
+          method: req.method,
+          headers: forwardedHeaders,
+          body: bodyText,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      let responseBody = await upstream.text();
+      let responseMappingId = null;
+      if (scrubResponse) {
+        const ctype = upstream.headers.get('content-type') || '';
+        if (ctype.includes('text/event-stream')) {
+          const scrubbed = scrubSseText(responseBody, rules, inputBody.reversible === true, db);
+          responseBody = scrubbed.text;
+          responseMappingId = scrubbed.mappingId;
+        } else {
+          const mappingId = inputBody.reversible === true ? crypto.randomBytes(12).toString('hex') : null;
+          const scrubbed = scrubText(responseBody, rules, mappingId, db);
+          responseBody = scrubbed.text;
+          responseMappingId = mappingId;
+        }
+      }
+
+      metrics.scrubProxyRequestsTotal.inc();
+      res.status(upstream.status);
+      if (scrubResponse) setScrubbedForwardResponseHeaders(res, upstream.headers);
+      else setForwardResponseHeaders(res, upstream.headers);
+      if (reqAtt && reqAtt.token) res.setHeader('x-scrubber-attestation', reqAtt.token);
+      if (scrubbedReq.mappingId) res.setHeader('x-scrub-mapping-id-req', scrubbedReq.mappingId);
+      if (responseMappingId) res.setHeader('x-scrub-mapping-id-res', responseMappingId);
+      return res.send(responseBody);
+    } catch (e) {
+      if (e && e.code === 'ssrf_blocked') return res.status(400).json({ error: 'ssrf_blocked' });
+      if (e && e.code === 'bad_target') return res.status(400).json({ error: 'bad_target' });
+      return next(e);
+    }
+  });
+
   app.post('/scrub', async (req, res, next) => {
     try {
       return await handleScrub(req, res);
@@ -456,18 +754,174 @@ function createApp() {
     return res.status(500).json({ error: String((err && err.message) || err) });
   });
 
-  return app;
+  return { app, metrics, db };
 }
 
 function startWorker() {
-  const app = createApp();
-  app.listen(PORT, HOST, () => {
+  const { app, metrics, db } = createApp();
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
+  let activeWsConnections = 0;
+  const wsRateBuckets = new Map();
+  const wsCapacityPending = new Map();
+  let wsCapacityRequestId = 0;
+
+  process.on('message', (msg) => {
+    if (!msg || msg.type !== 'ws-capacity-response') return;
+    const resolve = wsCapacityPending.get(msg.id);
+    if (!resolve) return;
+    wsCapacityPending.delete(msg.id);
+    resolve(msg.allowed === true);
+  });
+
+  function acquireGlobalWsSlot() {
+    if (!(cluster.isWorker && process.send)) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const id = ++wsCapacityRequestId;
+      wsCapacityPending.set(id, resolve);
+      process.send({ type: 'ws-capacity-acquire', id });
+    });
+  }
+
+  function releaseGlobalWsSlot() {
+    if (cluster.isWorker && process.send) {
+      process.send({ type: 'ws-capacity-release' });
+    }
+  }
+
+  server.on('upgrade', async (req, socket, head) => {
+    try {
+      if (req.url == null || !req.url.startsWith('/ws')) {
+        socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      if (!isAuthorized(req)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      const ip = req.socket.remoteAddress || 'unknown';
+      const rl = checkLocalRateLimit(wsRateBuckets, ip);
+      if (!rl.allowed) {
+        socket.write(`HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${rl.retryAfter}\r\n\r\n`);
+        socket.destroy();
+        return;
+      }
+
+      const slotGranted = await acquireGlobalWsSlot();
+      if (!slotGranted || activeWsConnections >= SCRUBBER_WS_MAX_CONNECTIONS) {
+        socket.write('HTTP/1.1 503 Service Unavailable\r\nX-Error: ws-capacity-exceeded\r\n\r\n');
+        socket.destroy();
+        if (slotGranted) releaseGlobalWsSlot();
+        return;
+      }
+
+      const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const target = reqUrl.searchParams.get('target');
+      if (!target) {
+        socket.write('HTTP/1.1 400 Bad Request\r\nX-Error: target-required\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      const safeTarget = await assertSafeTarget(target);
+      if (!['ws:', 'wss:'].includes(safeTarget.url.protocol)) {
+        socket.write('HTTP/1.1 400 Bad Request\r\nX-Error: bad-target\r\n\r\n');
+        socket.destroy();
+        releaseGlobalWsSlot();
+        return;
+      }
+
+      const rules = parseRules(req.url);
+      const upstreamHeaders = forwardRequestHeaders(req.headers);
+      const upstream = new WebSocket(safeTarget.url.toString(), {
+        handshakeTimeout: SCRUBBER_CONNECTION_TIMEOUT,
+        headers: upstreamHeaders,
+      });
+
+      const onUpstreamConnectError = () => {
+        if (socket.writable) {
+          socket.write('HTTP/1.1 502 Bad Gateway\r\nX-Error: upstream-connection-failed\r\n\r\n');
+        }
+        socket.destroy();
+        releaseGlobalWsSlot();
+      };
+      upstream.once('error', onUpstreamConnectError);
+
+      upstream.once('open', () => {
+        upstream.off('error', onUpstreamConnectError);
+        wss.handleUpgrade(req, socket, head, (client) => {
+          activeWsConnections += 1;
+          metrics.scrubWsActiveConnections.set(activeWsConnections);
+
+          client.on('message', (data, isBinary) => {
+            if (isBinary) {
+              upstream.send(data, { binary: true });
+              return;
+            }
+            const text = data.toString('utf8');
+            const scrubbed = scrubText(text, rules, null, db).text;
+            metrics.scrubWsFramesProcessedTotal.labels('outbound').inc();
+            metrics.scrubWsBytesScrubbedTotal.labels('outbound').inc(Buffer.byteLength(scrubbed, 'utf8'));
+            upstream.send(scrubbed, { binary: false });
+          });
+
+          upstream.on('message', (data, isBinary) => {
+            if (isBinary) {
+              client.send(data, { binary: true });
+              return;
+            }
+            const text = data.toString('utf8');
+            const scrubbed = scrubText(text, rules, null, db).text;
+            metrics.scrubWsFramesProcessedTotal.labels('inbound').inc();
+            metrics.scrubWsBytesScrubbedTotal.labels('inbound').inc(Buffer.byteLength(scrubbed, 'utf8'));
+            client.send(scrubbed, { binary: false });
+          });
+
+          client.on('close', (code, reason) => {
+            if (upstream.readyState === WebSocket.OPEN) upstream.close(code, reason);
+          });
+          upstream.on('close', (code, reason) => {
+            if (client.readyState === WebSocket.OPEN) client.close(code, reason);
+          });
+
+          let settled = false;
+          const settle = () => {
+            if (settled) return;
+            settled = true;
+            activeWsConnections = Math.max(0, activeWsConnections - 1);
+            metrics.scrubWsActiveConnections.set(activeWsConnections);
+            releaseGlobalWsSlot();
+          };
+          client.once('close', settle);
+          upstream.once('close', settle);
+          client.on('error', settle);
+          upstream.on('error', settle);
+        });
+      });
+    } catch (e) {
+      if (e && e.code === 'ssrf_blocked') {
+        socket.write('HTTP/1.1 400 Bad Request\r\nX-Error: ssrf_blocked\r\n\r\n');
+        socket.destroy();
+        releaseGlobalWsSlot();
+        return;
+      }
+      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      socket.destroy();
+      releaseGlobalWsSlot();
+    }
+  });
+
+  server.listen(PORT, HOST, () => {
     logger.info({ host: HOST, port: PORT, worker_id: cluster.isWorker ? cluster.worker.id : null }, 'listening');
   });
 }
 
 if (cluster.isPrimary) {
   const rateBuckets = new Map();
+  let activeWsConnectionsGlobal = 0;
 
   cluster.on('message', (worker, msg) => {
     if (!msg || msg.type !== 'rate-limit-check') return;
@@ -487,6 +941,21 @@ if (cluster.isPrimary) {
     current.tokens -= 1;
     rateBuckets.set(msg.ip, current);
     worker.send({ type: 'rate-limit-response', id: msg.id, allowed: true, retryAfter: 0 });
+  });
+
+  cluster.on('message', (worker, msg) => {
+    if (!msg || msg.type !== 'ws-capacity-acquire') return;
+    if (activeWsConnectionsGlobal >= SCRUBBER_WS_MAX_CONNECTIONS) {
+      worker.send({ type: 'ws-capacity-response', id: msg.id, allowed: false });
+      return;
+    }
+    activeWsConnectionsGlobal += 1;
+    worker.send({ type: 'ws-capacity-response', id: msg.id, allowed: true });
+  });
+
+  cluster.on('message', (worker, msg) => {
+    if (!msg || msg.type !== 'ws-capacity-release') return;
+    activeWsConnectionsGlobal = Math.max(0, activeWsConnectionsGlobal - 1);
   });
 
   initPrimaryMaintenance();
