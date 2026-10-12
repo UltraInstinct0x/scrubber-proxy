@@ -11,7 +11,7 @@ POST text or an agent trace; returns the same body with PII/secrets replaced by 
 ## what it doesn't do
 
 - **L5 free-form PII is best-effort, not 100%.** novel name patterns, context-dependent PII, and prose-only identifiers require NER and aren't promised. add a rule pack or post-process if you need that. (L1–L4 *are* 100%-promised and gated in CI — see the v0.6.0 tier contract above.)
-- **reversible by design.** mappings are stored encrypted under a static env key. that's a *feature* for audit/legal-hold; document it honestly to your buyers.
+- **reversible by design.** mappings are stored encrypted under a key derived from `SCRUBBER_REVERSAL_KEY`. that's a *feature* for audit/legal-hold; document it honestly to your buyers. if the variable is unset, the service falls back to a built-in development value (see limitations below).
 - **symmetric HS256 key management only.** v0.5 adds `kid` rotation with env-managed keys; KMS-backed key management remains future work.
 
 ## attestation tokens (v0.2)
@@ -150,17 +150,17 @@ All via environment variables:
 
 | var | default | description |
 |---|---|---|
-| `SCRUBBER_PORT` | `3017` | listen port |
-| `SCRUBBER_HOST` | `127.0.0.1` | listen address |
+| `PORT` | `3017` | listen port. read from `PORT`; the `SCRUBBER_PORT` name in earlier docs is not read. |
+| `HOST` | `127.0.0.1` | listen address. read from `HOST`; the `SCRUBBER_HOST` name in earlier docs is not read. |
 | `SCRUBBER_API_KEY` | — | required for auth (unless `SCRUBBER_AUTH=none`) |
 | `SCRUBBER_ADMIN_KEY` | — | required for `/admin/*` and admin audit endpoints |
-| `SCRUBBER_AUTH` | `required` | `required` or `none` (bypass all auth) |
+| `SCRUBBER_AUTH` | `key` | `key` (require the `x-scrubber-key` header) or `none` (bypass all auth) |
 | `SCRUBBER_JWT_SECRET` | — | HS256 signing key (32 bytes hex) |
 | `SCRUBBER_JWT_PRIMARY_KEY` | — | primary HS256 signing key for new attestations (`kid=hs256-primary`) |
 | `SCRUBBER_JWT_VERIFICATION_KEYS` | — | comma-separated `kid:secret` pairs for verifier keyring and no-`kid` fallback |
-| `SCRUBBER_REVERSAL_KEY` | — | AES-256-GCM mapping encryption key |
-| `SCRUBBER_RATE_LIMIT_RPS` | `1000` | requests per second per IP |
-| `SCRUBBER_RATE_LIMIT_BURST` | `2000` | burst window |
+| `SCRUBBER_REVERSAL_KEY` | dev fallback | AES-256-GCM mapping encryption key. if unset, a built-in development value committed to the repo is used (see limitations below). |
+| `SCRUBBER_RATE_LIMIT_RPS` | hardcoded `1000` | requests per second per IP. hardcoded in `server.js`; this variable is not read. |
+| `SCRUBBER_RATE_LIMIT_BURST` | hardcoded `1000` | burst capacity. hardcoded in `server.js`; this variable is not read. |
 | `SCRUBBER_RATE_LIMIT_BYPASS_CIDR` | — | comma-separated CIDRs (e.g. `10.0.0.0/8,192.168.0.0/16`) |
 | `SCRUBBER_LOG_LEVEL` | `info` | pino level (`trace`, `debug`, `info`, `warn`, `error`, `fatal`) |
 | `SCRUBBER_DATA_DIR` | `./data` | sqlite mapping store location |
@@ -195,7 +195,26 @@ Public via nginx: `~/bin/add-vhost.sh scrubber 3017` → https://scrubber.goku.c
 
 See `~/panel/deploy/docker-compose.yml` — brings up panel + scrubber side-by-side. Operators bring their own ingress.
 
-## roadmap
+## Implemented in repository
+
+- Regex and dictionary scrubbing that replaces PII and secrets with typed tokens, reversible through an encrypted sqlite mapping store.
+- Rule packs under `rules/` (`base`, `eu`, `tr`, `medical`).
+- Short-lived HS256 attestation JWTs bound to each sanitized response.
+- `node:cluster` multi-worker operation, `x-scrubber-key` auth, tenant admin endpoints, and an append-only audit hash chain.
+- HTTP reverse proxy (`/proxy`) and bidirectional WebSocket proxy (`/ws`).
+- `pino` structured logging and Prometheus metrics on `/metrics`.
+
+## Limitations and unverified behavior
+
+- **Default reversal key.** If `SCRUBBER_REVERSAL_KEY` is not set, the service derives the AES-256-GCM mapping key from a built-in development value that is committed to the repository. There is no environment check or production guard anywhere in the code (no `NODE_ENV` handling), so the fallback applies in every deployment unless the variable is set explicitly. Set it in any real deployment.
+- **The fallback is untested.** No test references the reversal key or the fallback path.
+- **Config table drift.** `server.js` reads `PORT` and `HOST`, hardcodes the rate limit, and defaults `SCRUBBER_AUTH` to `key`, which differs from older wording in this file; the table above reflects the code.
+- **L5 free-form PII stays best-effort.** See the note above.
+- **Tests were not run for this documentation.** `package.json` defines test scripts and `tests/` holds tier fixtures, but `node_modules` is not installed in this checkout, so nothing was executed.
+
+## Roadmap (proposals, not commitments)
+
+Unchecked items are proposals, not commitments or scheduled work.
 
 - [x] attestation jwts (v0.2)
 - [x] landing page at scrubber.goku.codes (v0.2)
